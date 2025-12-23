@@ -1,0 +1,26 @@
+// ort_import.h - ONNX Runtime API import header.
+//
+// This header wraps the ONNX Runtime C++ API include with the necessary
+// ORT_API_MANUAL_INIT define to prevent static initialization issues.
+// Include this file instead of including onnxruntime_cxx_api.h directly.
+
+#ifndef IREE_ONNX_EP_SRC_ORT_IMPORT_H_
+#define IREE_ONNX_EP_SRC_ORT_IMPORT_H_
+
+// ORT_API_MANUAL_INIT prevents static initialization of the C++ API.
+// We must call Ort::InitApi() explicitly before using any C++ API wrappers.
+#define ORT_API_MANUAL_INIT
+#include "onnxruntime/core/session/onnxruntime_cxx_api.h"
+#undef ORT_API_MANUAL_INIT
+
+// Helper macro for ORT status checking (returns OrtStatus* on failure).
+// Use this macro to propagate OrtStatus* errors from called functions.
+#define ORT_RETURN_IF_ERROR(expr)                   \
+  do {                                              \
+    OrtStatus* _ort_status = (expr);                \
+    if (_ort_status != nullptr) {                   \
+      return _ort_status;                           \
+    }                                               \
+  } while (0)
+
+#endif  // IREE_ONNX_EP_SRC_ORT_IMPORT_H_

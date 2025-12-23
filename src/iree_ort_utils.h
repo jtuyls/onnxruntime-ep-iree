@@ -1,0 +1,80 @@
+// iree_ort_utils.h - ORT/IREE type conversion and tensor utilities.
+//
+// Provides element type mapping between ONNX and IREE, and buffer/tensor
+// conversion utilities for data transfer between ORT and IREE runtime.
+
+#ifndef IREE_ONNX_EP_IREE_ORT_UTILS_H_
+#define IREE_ONNX_EP_IREE_ORT_UTILS_H_
+
+#include <vector>
+
+#include "iree/hal/api.h"
+#include "iree_wrappers.h"
+#include "ort_import.h"
+
+namespace iree_onnx_ep {
+
+// ============================================================================
+// Element Type Mapping
+// ============================================================================
+
+// Converts ONNX tensor element data type to IREE HAL element type.
+// Returns IREE_HAL_ELEMENT_TYPE_NONE for unsupported types.
+iree_hal_element_type_t OnnxToIreeElementType(
+    ONNXTensorElementDataType onnx_type);
+
+// Converts IREE HAL element type to ONNX tensor element data type.
+// Returns ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED for unsupported types.
+ONNXTensorElementDataType IreeToOnnxElementType(
+    iree_hal_element_type_t iree_type);
+
+// Returns the byte size of an ONNX element type.
+// Returns 0 for unsupported types.
+size_t OnnxElementTypeSize(ONNXTensorElementDataType type);
+
+// ============================================================================
+// Buffer/Tensor Conversion
+// ============================================================================
+
+// Converts an ORT input tensor to an IREE buffer view.
+// The buffer view is allocated on the device and data is copied from host.
+//
+// Parameters:
+//   ort_value - Input ORT tensor (const, read-only)
+//   device - IREE HAL device for allocation
+//   allocator - Device allocator from session
+//   host_allocator - Host allocator for metadata
+//   out_buffer_view - Output buffer view (caller must release)
+//
+// Returns nullptr on success, OrtStatus* on error.
+OrtStatus* OrtTensorToIreeBufferView(
+    const Ort::ConstValue& ort_value,
+    iree_hal_device_t* device,
+    iree_hal_allocator_t* allocator,
+    iree_allocator_t host_allocator,
+    iree_hal_buffer_view_t** out_buffer_view);
+
+// Copies data from an IREE buffer view to an ORT output tensor.
+// The ORT tensor must already be allocated with matching shape.
+//
+// Parameters:
+//   buffer_view - Input IREE buffer view
+//   ort_value - Output ORT tensor (mutable)
+//   device - IREE HAL device for transfer
+//
+// Returns nullptr on success, OrtStatus* on error.
+OrtStatus* IreeBufferViewToOrtTensor(
+    iree_hal_buffer_view_t* buffer_view,
+    Ort::UnownedValue ort_value,
+    iree_hal_device_t* device);
+
+// Extracts shape from an IREE buffer view as int64_t vector for ORT.
+std::vector<int64_t> GetBufferViewShape(iree_hal_buffer_view_t* buffer_view);
+
+// Calculates total byte size from shape and element type.
+size_t CalculateTensorByteSize(const std::vector<int64_t>& shape,
+                               ONNXTensorElementDataType element_type);
+
+}  // namespace iree_onnx_ep
+
+#endif  // IREE_ONNX_EP_IREE_ORT_UTILS_H_

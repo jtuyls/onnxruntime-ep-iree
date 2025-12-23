@@ -1,0 +1,119 @@
+// iree_ep.h - IREE Execution Provider
+//
+// This file defines the IreeEp class which handles graph partitioning,
+// compilation, and execution using IREE as the backend.
+
+#ifndef IREE_ONNX_EP_IREE_EP_H_
+#define IREE_ONNX_EP_IREE_EP_H_
+
+#include <string>
+
+#include "iree_ep_factory.h"
+#include "iree_wrappers.h"
+#include "ort_import.h"
+
+namespace iree_onnx_ep {
+
+// Forward declarations
+class IreeEpFactory;
+
+// IREE Execution Provider.
+// Handles graph partitioning, compilation, and execution using IREE runtime.
+// Each EP instance owns an IREE HAL device created from the factory's instance.
+class IreeEp : public OrtEp, public ApiPtrs {
+ public:
+  struct Config {
+    bool enable_ep_context = false;
+    // Target device for IREE: target://id . For example:
+    // "vulkan://0",
+    // "cuda://1",
+    // "local-task://0",
+    // "hip://GPU-00000000-1111-2222-3333-444444444444".
+    //
+    // TODO: In future, we may want to not support adding an explicit id here
+    // and instead query it directly from the OrtHardwareDevice.
+    std::string device = "";
+    // Target architecture to compile for.
+    std::string target_arch = "";  // e.g., "gfx1100", "mi300x"
+    // Optimization level for the IREE compiler: O0, O1, O2, O3
+    std::string opt_level = "O0";
+    // Backend to use for the device.
+    std::string backend = "";
+    // Save intermediate compilation artifacts (MLIR, VMFB) for debugging.
+    bool save_intermediates = false;
+  };
+
+  IreeEp(IreeEpFactory& factory, const std::string& name, const Config& config,
+         const OrtLogger& logger, HalDevicePtr device);
+
+  ~IreeEp() = default;
+
+  // Accessor for the IREE device (per-EP).
+  iree_hal_device_t* IreeDevice() const { return device_.Get(); }
+
+ private:
+  // EP interface implementations (called via function pointers)
+
+  // Returns the EP name
+  static const char* ORT_API_CALL GetNameImpl(const OrtEp* this_ptr) noexcept;
+
+  // Determines which nodes the EP can execute
+  // For now: claims ALL nodes (compile mode)
+  static OrtStatus* ORT_API_CALL
+  GetCapabilityImpl(OrtEp* this_ptr, const OrtGraph* graph,
+                    OrtEpGraphSupportInfo* graph_support_info) noexcept;
+
+  // Compiles fused subgraphs into executable code
+  // For now: fails with "not implemented"
+  static OrtStatus* ORT_API_CALL CompileImpl(
+      OrtEp* this_ptr, const OrtGraph** graphs, const OrtNode** fused_nodes,
+      size_t count, OrtNodeComputeInfo** node_compute_infos,
+      OrtNode** ep_context_nodes) noexcept;
+
+  // Releases node compute infos created in Compile
+  static void ORT_API_CALL ReleaseNodeComputeInfosImpl(
+      OrtEp* this_ptr, OrtNodeComputeInfo** node_compute_infos,
+      size_t num_node_compute_infos) noexcept;
+
+  // Member variables
+  IreeEpFactory& factory_;
+  std::string name_;
+  Config config_;
+  Ort::Logger logger_;
+
+  // IREE HAL device (per-EP, created from factory's instance).
+  HalDevicePtr device_;
+};
+
+// Compute kernel for compiled nodes.
+// Holds the IREE session and function for a compiled subgraph.
+struct IreeNodeComputeInfo : OrtNodeComputeInfo {
+  // Constructor takes ownership of session and stores function reference.
+  // Session is created in CompileImpl and passed here.
+  IreeNodeComputeInfo(IreeEp& ep, RuntimeSessionPtr session,
+                      iree_vm_function_t function);
+
+  // Creates per-node computation state
+  static OrtStatus* ORT_API_CALL CreateStateImpl(
+      OrtNodeComputeInfo* this_ptr, OrtNodeComputeContext* compute_context,
+      void** compute_state) noexcept;
+
+  // Executes the computation
+  static OrtStatus* ORT_API_CALL
+  ComputeImpl(OrtNodeComputeInfo* this_ptr, void* compute_state,
+              OrtKernelContext* kernel_context) noexcept;
+
+  // Releases computation state
+  static void ORT_API_CALL ReleaseStateImpl(OrtNodeComputeInfo* this_ptr,
+                                            void* compute_state) noexcept;
+
+  IreeEp& ep;
+
+  // IREE runtime state for this compiled subgraph.
+  RuntimeSessionPtr session_;
+  iree_vm_function_t function_;
+};
+
+}  // namespace iree_onnx_ep
+
+#endif  // IREE_ONNX_EP_IREE_EP_H_
