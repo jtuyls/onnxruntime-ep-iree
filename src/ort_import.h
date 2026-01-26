@@ -15,12 +15,12 @@
 
 // Helper macro for ORT status checking (returns OrtStatus* on failure).
 // Use this macro to propagate OrtStatus* errors from called functions.
-#define ORT_RETURN_IF_ERROR(expr)                   \
-  do {                                              \
-    OrtStatus* _ort_status = (expr);                \
-    if (_ort_status != nullptr) {                   \
-      return _ort_status;                           \
-    }                                               \
+#define ORT_RETURN_IF_ERROR(expr)    \
+  do {                               \
+    OrtStatus* _ort_status = (expr); \
+    if (_ort_status != nullptr) {    \
+      return _ort_status;            \
+    }                                \
   } while (0)
 
 #endif  // IREE_ONNX_EP_SRC_ORT_IMPORT_H_

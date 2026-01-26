@@ -22,9 +22,7 @@ class IreePtr {
   ~IreePtr() { Reset(); }
 
   // Move-only semantics.
-  IreePtr(IreePtr&& other) noexcept : ptr_(other.ptr_) {
-    other.ptr_ = nullptr;
-  }
+  IreePtr(IreePtr&& other) noexcept : ptr_(other.ptr_) { other.ptr_ = nullptr; }
 
   IreePtr& operator=(IreePtr&& other) noexcept {
     if (this != &other) {
@@ -76,22 +74,20 @@ class IreePtr {
 };
 
 // Type aliases for IREE runtime types.
-using RuntimeInstancePtr = IreePtr<iree_runtime_instance_t,
-                                   iree_runtime_instance_retain,
-                                   iree_runtime_instance_release>;
+using RuntimeInstancePtr =
+    IreePtr<iree_runtime_instance_t, iree_runtime_instance_retain,
+            iree_runtime_instance_release>;
 
-using RuntimeSessionPtr = IreePtr<iree_runtime_session_t,
-                                  iree_runtime_session_retain,
-                                  iree_runtime_session_release>;
+using RuntimeSessionPtr =
+    IreePtr<iree_runtime_session_t, iree_runtime_session_retain,
+            iree_runtime_session_release>;
 
 // Type aliases for IREE HAL types.
-using HalDevicePtr = IreePtr<iree_hal_device_t,
-                             iree_hal_device_retain,
-                             iree_hal_device_release>;
+using HalDevicePtr =
+    IreePtr<iree_hal_device_t, iree_hal_device_retain, iree_hal_device_release>;
 
-using HalDriverPtr = IreePtr<iree_hal_driver_t,
-                             iree_hal_driver_retain,
-                             iree_hal_driver_release>;
+using HalDriverPtr =
+    IreePtr<iree_hal_driver_t, iree_hal_driver_retain, iree_hal_driver_release>;
 
 // RAII wrapper for memory allocated by IREE that needs iree_allocator_free.
 template <typename T>
@@ -143,20 +139,17 @@ class IreeAllocatedPtr {
   T* ptr_;
 };
 
-using HalBufferViewPtr = IreePtr<iree_hal_buffer_view_t,
-                                 iree_hal_buffer_view_retain,
-                                 iree_hal_buffer_view_release>;
+using HalBufferViewPtr =
+    IreePtr<iree_hal_buffer_view_t, iree_hal_buffer_view_retain,
+            iree_hal_buffer_view_release>;
 
-using HalBufferPtr = IreePtr<iree_hal_buffer_t,
-                             iree_hal_buffer_retain,
-                             iree_hal_buffer_release>;
+using HalBufferPtr =
+    IreePtr<iree_hal_buffer_t, iree_hal_buffer_retain, iree_hal_buffer_release>;
 
 // Wrapper for iree_runtime_call_t (stack-allocated, needs deinitialize).
 class RuntimeCall {
  public:
-  RuntimeCall() : initialized_(false) {
-    std::memset(&call_, 0, sizeof(call_));
-  }
+  RuntimeCall() : initialized_(false) { std::memset(&call_, 0, sizeof(call_)); }
 
   ~RuntimeCall() { Deinitialize(); }
 
@@ -195,8 +188,9 @@ inline OrtStatus* IreeStatusToOrtStatus(iree_status_t status) {
   iree_host_size_t message_size = 0;
   iree_status_to_string(status, &allocator, &message_buffer, &message_size);
 
-  std::string message =
-      message_buffer ? std::string(message_buffer, message_size) : "Unknown IREE error";
+  std::string message = message_buffer
+                            ? std::string(message_buffer, message_size)
+                            : "Unknown IREE error";
   if (message_buffer) {
     iree_allocator_free(allocator, message_buffer);
   }
@@ -228,12 +222,12 @@ inline OrtStatus* IreeStatusToOrtStatus(iree_status_t status) {
 }
 
 // Helper macro for IREE status checking (returns OrtStatus* on failure).
-#define IREE_ORT_RETURN_IF_ERROR(expr)              \
-  do {                                              \
-    iree_status_t _status = (expr);                 \
-    if (!iree_status_is_ok(_status)) {              \
-      return IreeStatusToOrtStatus(_status);        \
-    }                                               \
+#define IREE_ORT_RETURN_IF_ERROR(expr)       \
+  do {                                       \
+    iree_status_t _status = (expr);          \
+    if (!iree_status_is_ok(_status)) {       \
+      return IreeStatusToOrtStatus(_status); \
+    }                                        \
   } while (0)
 
 }  // namespace iree_onnx_ep

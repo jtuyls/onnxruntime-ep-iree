@@ -19,9 +19,9 @@ inline constexpr const char* kEpVersion = "0.1.0";
 // Hardware vendor IDs for device matching.
 // These match OrtDevice::VendorIds from onnxruntime/core/framework/ortdevice.h.
 namespace VendorIds {
-inline constexpr uint32_t kAmd = 0x1002;      // AMD: ROCm, MIGraphX EPs
-inline constexpr uint32_t kNvidia = 0x10DE;   // NVIDIA: CUDA/TensorRT
-inline constexpr uint32_t kIntel = 0x8086;    // Intel: OpenVINO
+inline constexpr uint32_t kAmd = 0x1002;     // AMD: ROCm, MIGraphX EPs
+inline constexpr uint32_t kNvidia = 0x10DE;  // NVIDIA: CUDA/TensorRT
+inline constexpr uint32_t kIntel = 0x8086;   // Intel: OpenVINO
 }  // namespace VendorIds
 
 // Helper struct to pass API pointers
@@ -37,7 +37,8 @@ struct ApiPtrs {
 // by this factory.
 class IreeEpFactory : public OrtEpFactory, public ApiPtrs {
  public:
-  IreeEpFactory(const char* ep_name, ApiPtrs apis, const OrtLogger* default_logger);
+  IreeEpFactory(const char* ep_name, ApiPtrs apis,
+                const OrtLogger* default_logger);
   ~IreeEpFactory();
 
   // Accessor for the shared IREE runtime instance.
@@ -45,49 +46,45 @@ class IreeEpFactory : public OrtEpFactory, public ApiPtrs {
 
  private:
   // Factory interface implementations (called via function pointers)
-  static const char* ORT_API_CALL GetNameImpl(const OrtEpFactory* this_ptr) noexcept;
-  static const char* ORT_API_CALL GetVendorImpl(const OrtEpFactory* this_ptr) noexcept;
-  static uint32_t ORT_API_CALL GetVendorIdImpl(const OrtEpFactory* this_ptr) noexcept;
-  static const char* ORT_API_CALL GetVersionImpl(const OrtEpFactory* this_ptr) noexcept;
+  static const char* ORT_API_CALL
+  GetNameImpl(const OrtEpFactory* this_ptr) noexcept;
+  static const char* ORT_API_CALL
+  GetVendorImpl(const OrtEpFactory* this_ptr) noexcept;
+  static uint32_t ORT_API_CALL
+  GetVendorIdImpl(const OrtEpFactory* this_ptr) noexcept;
+  static const char* ORT_API_CALL
+  GetVersionImpl(const OrtEpFactory* this_ptr) noexcept;
 
   static OrtStatus* ORT_API_CALL GetSupportedDevicesImpl(
-      OrtEpFactory* this_ptr,
-      const OrtHardwareDevice* const* devices,
-      size_t num_devices,
-      OrtEpDevice** ep_devices,
-      size_t max_ep_devices,
+      OrtEpFactory* this_ptr, const OrtHardwareDevice* const* devices,
+      size_t num_devices, OrtEpDevice** ep_devices, size_t max_ep_devices,
       size_t* p_num_ep_devices) noexcept;
 
-  static OrtStatus* ORT_API_CALL CreateEpImpl(
-      OrtEpFactory* this_ptr,
-      const OrtHardwareDevice* const* devices,
-      const OrtKeyValuePairs* const* ep_metadata,
-      size_t num_devices,
-      const OrtSessionOptions* session_options,
-      const OrtLogger* logger,
-      OrtEp** ep) noexcept;
+  static OrtStatus* ORT_API_CALL
+  CreateEpImpl(OrtEpFactory* this_ptr, const OrtHardwareDevice* const* devices,
+               const OrtKeyValuePairs* const* ep_metadata, size_t num_devices,
+               const OrtSessionOptions* session_options,
+               const OrtLogger* logger, OrtEp** ep) noexcept;
 
-  static void ORT_API_CALL ReleaseEpImpl(OrtEpFactory* this_ptr, OrtEp* ep) noexcept;
+  static void ORT_API_CALL ReleaseEpImpl(OrtEpFactory* this_ptr,
+                                         OrtEp* ep) noexcept;
 
-  static OrtStatus* ORT_API_CALL CreateAllocatorImpl(
-      OrtEpFactory* this_ptr,
-      const OrtMemoryInfo* memory_info,
-      const OrtKeyValuePairs* allocator_options,
-      OrtAllocator** allocator) noexcept;
+  static OrtStatus* ORT_API_CALL
+  CreateAllocatorImpl(OrtEpFactory* this_ptr, const OrtMemoryInfo* memory_info,
+                      const OrtKeyValuePairs* allocator_options,
+                      OrtAllocator** allocator) noexcept;
 
   static void ORT_API_CALL ReleaseAllocatorImpl(
-      OrtEpFactory* this_ptr,
-      OrtAllocator* allocator) noexcept;
+      OrtEpFactory* this_ptr, OrtAllocator* allocator) noexcept;
 
   static OrtStatus* ORT_API_CALL CreateDataTransferImpl(
-      OrtEpFactory* this_ptr,
-      OrtDataTransferImpl** data_transfer) noexcept;
+      OrtEpFactory* this_ptr, OrtDataTransferImpl** data_transfer) noexcept;
 
-  static bool ORT_API_CALL IsStreamAwareImpl(const OrtEpFactory* this_ptr) noexcept;
+  static bool ORT_API_CALL
+  IsStreamAwareImpl(const OrtEpFactory* this_ptr) noexcept;
 
   static OrtStatus* ORT_API_CALL CreateSyncStreamForDeviceImpl(
-      OrtEpFactory* this_ptr,
-      const OrtMemoryDevice* memory_device,
+      OrtEpFactory* this_ptr, const OrtMemoryDevice* memory_device,
       const OrtKeyValuePairs* stream_options,
       OrtSyncStreamImpl** stream) noexcept;
 

@@ -47,12 +47,11 @@ size_t OnnxElementTypeSize(ONNXTensorElementDataType type);
 //   out_buffer_view - Output buffer view (caller must release)
 //
 // Returns nullptr on success, OrtStatus* on error.
-OrtStatus* OrtTensorToIreeBufferView(
-    const Ort::ConstValue& ort_value,
-    iree_hal_device_t* device,
-    iree_hal_allocator_t* allocator,
-    iree_allocator_t host_allocator,
-    iree_hal_buffer_view_t** out_buffer_view);
+OrtStatus* OrtTensorToIreeBufferView(const Ort::ConstValue& ort_value,
+                                     iree_hal_device_t* device,
+                                     iree_hal_allocator_t* allocator,
+                                     iree_allocator_t host_allocator,
+                                     iree_hal_buffer_view_t** out_buffer_view);
 
 // Copies data from an IREE buffer view to an ORT output tensor.
 // The ORT tensor must already be allocated with matching shape.
@@ -63,10 +62,9 @@ OrtStatus* OrtTensorToIreeBufferView(
 //   device - IREE HAL device for transfer
 //
 // Returns nullptr on success, OrtStatus* on error.
-OrtStatus* IreeBufferViewToOrtTensor(
-    iree_hal_buffer_view_t* buffer_view,
-    Ort::UnownedValue ort_value,
-    iree_hal_device_t* device);
+OrtStatus* IreeBufferViewToOrtTensor(iree_hal_buffer_view_t* buffer_view,
+                                     Ort::UnownedValue ort_value,
+                                     iree_hal_device_t* device);
 
 // Extracts shape from an IREE buffer view as int64_t vector for ORT.
 std::vector<int64_t> GetBufferViewShape(iree_hal_buffer_view_t* buffer_view);

@@ -67,9 +67,9 @@ endif()
 # We choose not to take a source dependency on the IREE compiler, which is
 # quite heavy and can be slow to build. It is left to the consumer of the EP to
 # make sure iree compiler tooling scripts are available in their environment.
-# This can be generally done by `pip install iree-base-compiler`. 
+# This can be generally done by `pip install iree-base-compiler`.
 
-# We may in future decide to build the IREE compiler from source. 
+# We may in future decide to build the IREE compiler from source.
 #
 ################################################################################
 

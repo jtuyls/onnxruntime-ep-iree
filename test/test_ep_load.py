@@ -49,31 +49,38 @@ def test_ep_load():
     print("Device metadata:", iree_device.device.metadata)
     print("Device type:", iree_device.device.type)
 
-    a = np.array([[1, 2, 3, 4],
-                  [5, 6, 7, 8],
-                  [9, 10, 11, 12]], dtype=np.float32)
-    b = np.array([[10, 20, 30, 40],
-                  [50, 60, 70, 80],
-                  [90, 100, 110, 120]], dtype=np.float32)
+    a = np.array([[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]], dtype=np.float32)
+    b = np.array(
+        [[10, 20, 30, 40], [50, 60, 70, 80], [90, 100, 110, 120]], dtype=np.float32
+    )
 
     # Create a simple Add model
-    input_a = helper.make_tensor_value_info('A', TensorProto.FLOAT, [3, 4])
+    input_a = helper.make_tensor_value_info("A", TensorProto.FLOAT, [3, 4])
     # input_b = helper.make_tensor_value_info('B', TensorProto.FLOAT, [3, 4])
-    output = helper.make_tensor_value_info('C', TensorProto.FLOAT, [3, 4])
-    constant_node = helper.make_node('Constant', inputs=[], outputs=['D'],
-                                     value=helper.make_tensor(name='const_tensor',
-                                                              data_type=TensorProto.FLOAT,
-                                                              dims=[3, 4],
-                                                              vals=b.flatten().tolist()))
-    add_node = helper.make_node('Add', inputs=['A', 'D'], outputs=['C'])
+    output = helper.make_tensor_value_info("C", TensorProto.FLOAT, [3, 4])
+    constant_node = helper.make_node(
+        "Constant",
+        inputs=[],
+        outputs=["D"],
+        value=helper.make_tensor(
+            name="const_tensor",
+            data_type=TensorProto.FLOAT,
+            dims=[3, 4],
+            vals=b.flatten().tolist(),
+        ),
+    )
+    add_node = helper.make_node("Add", inputs=["A", "D"], outputs=["C"])
 
-    graph = helper.make_graph([add_node, constant_node], 'test_graph', [input_a], [output])
-    model = helper.make_model(graph, producer_name='iree_test',
-                              opset_imports=[helper.make_opsetid('', 17)])
+    graph = helper.make_graph(
+        [add_node, constant_node], "test_graph", [input_a], [output]
+    )
+    model = helper.make_model(
+        graph, producer_name="iree_test", opset_imports=[helper.make_opsetid("", 17)]
+    )
     model.ir_version = 8
 
     # Save to temp file
-    with tempfile.NamedTemporaryFile(suffix='.onnx', delete=False) as f:
+    with tempfile.NamedTemporaryFile(suffix=".onnx", delete=False) as f:
         model_path = f.name
         onnx.save(model, model_path)
 
@@ -95,7 +102,7 @@ def test_ep_load():
         expected = a + b
 
         # Run inference
-        outputs = session.run(None, {'A': a})
+        outputs = session.run(None, {"A": a})
         result = outputs[0]
 
         # Verify output
