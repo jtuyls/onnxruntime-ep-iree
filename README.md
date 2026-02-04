@@ -4,7 +4,7 @@ ONNX Runtime Execution Provider using IREE.
 
 ## Installation
 
-## Build
+1. Build the plugin
 
 ```bash
 mkdir build && cd build
@@ -12,35 +12,22 @@ cmake .. -GNinja
 ninja
 ```
 
-Note that the plugin requires you to have iree-compiler tooling to be available
-in your path. The example inference below installs it using a python env. You
-can do the same.
-
-## Example Resnet-50 Inference
-
-We recommend using uv to manage python environments.
-
-You can install uv from :
-`https://docs.astral.sh/uv/getting-started/installation/#standalone-installer`
-
-1. Create and activate a new virtual environment:
+2. Create a virtual environment and install dependencies
 
 ```bash
-uv venv .env
+python3 -m venv .env
 source .env/bin/activate
+pip install -r requirements.txt
 ```
 
-2. Install required python packages:
+3. Install Python Package
 
 ```bash
-uv pip install -r requirements.txt
+IREE_ONNX_EP_BUILD_DIR=$(pwd)/build uv pip install -e python/
 ```
 
-3. Run jupyter notebook:
+4. Run sample test
 
 ```bash
-cd examples
-uv run --with jupyter jupyter lab
+python test/test_ep_load.py
 ```
-
-4. Open resnet50.ipynb and run the cells.

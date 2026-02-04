@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Test that the IREE ONNX Runtime EP loads and runs correctly."""
 
-import sys
 import pathlib
+import sys
 import tempfile
 import numpy as np
 import onnx
 from onnx import helper, TensorProto
 import onnxruntime as ort
+import iree_onnx_ep
 
 
 def test_ep_load():
@@ -17,28 +18,20 @@ def test_ep_load():
     ort.set_default_logger_severity(0)
 
     # Get the path to the built EP library
-    project_root = pathlib.Path(__file__).parent.parent
-    ep_lib_path = project_root / "build" / "libiree_onnx_ep.so"
-
-    if not ep_lib_path.exists():
-        print(f"ERROR: EP library not found at {ep_lib_path}")
-        print("Please build the project first:")
-        print("  mkdir build && cd build")
-        print("  cmake .. -GNinja")
-        print("  ninja")
-        return False
-
+    ep_lib_path = iree_onnx_ep.get_library_path()
     print(f"EP library path: {ep_lib_path}")
 
     # Register the EP plugin
-    ort.register_execution_provider_library("IREE", str(ep_lib_path))
+    ort.register_execution_provider_library(iree_onnx_ep.get_ep_name(), ep_lib_path)
     print("EP plugin registered successfully")
 
     # Get IREE device
-    iree_driver = "vulkan"
+    iree_driver = "local-task"
     ep_devices = ort.get_ep_devices()
+    print(ep_devices)
     iree_device = None
     for dev in ep_devices:
+        print(dev.device.metadata)
         if dev.device.metadata.get("iree.driver") == iree_driver:
             iree_device = dev
             break

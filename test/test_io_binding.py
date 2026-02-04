@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Test io_binding with device memory for the IREE ONNX Runtime EP."""
 
-import sys
 import pathlib
+import sys
 import tempfile
 import numpy as np
 import onnx
 from onnx import helper, TensorProto
 import onnxruntime as ort
+import iree_onnx_ep
 
 
 def test_io_binding():
@@ -17,21 +18,11 @@ def test_io_binding():
     ort.set_default_logger_severity(0)
 
     # Get the path to the built EP library
-    project_root = pathlib.Path(__file__).parent.parent
-    ep_lib_path = project_root / "build" / "libiree_onnx_ep.so"
-
-    if not ep_lib_path.exists():
-        print(f"ERROR: EP library not found at {ep_lib_path}")
-        print("Please build the project first:")
-        print("  mkdir build && cd build")
-        print("  cmake .. -GNinja")
-        print("  ninja")
-        return False
-
+    ep_lib_path = iree_onnx_ep.get_library_path()
     print(f"EP library path: {ep_lib_path}")
 
     # Register the EP plugin
-    ort.register_execution_provider_library("IREE", str(ep_lib_path))
+    ort.register_execution_provider_library(iree_onnx_ep.get_ep_name(), ep_lib_path)
     print("EP plugin registered successfully")
 
     # Get IREE device

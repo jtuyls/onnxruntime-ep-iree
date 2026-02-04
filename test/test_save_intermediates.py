@@ -11,6 +11,7 @@ import numpy as np
 import onnx
 import onnxruntime as ort
 from onnx import TensorProto, helper
+import iree_onnx_ep
 
 
 def get_iree_temp_files():
@@ -216,13 +217,8 @@ def main():
     print("Testing intermediate file handling")
     print("=" * 50)
 
-    project_root = pathlib.Path(__file__).parent.parent
-    ep_lib_path = project_root / "build" / "libiree_onnx_ep.so"
-
-    if not ep_lib_path.exists():
-        print(f"ERROR: EP library not found at {ep_lib_path}")
-        return False
-    ort.register_execution_provider_library("IREE", str(ep_lib_path))
+    ep_lib_path = iree_onnx_ep.get_library_path()
+    ort.register_execution_provider_library(iree_onnx_ep.get_ep_name(), ep_lib_path)
 
     results = []
 
