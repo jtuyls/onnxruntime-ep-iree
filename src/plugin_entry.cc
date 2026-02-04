@@ -5,7 +5,7 @@
 
 extern "C" {
 
-// Plugin entry point - creates EP factories
+// Plugin entry point - creates EP factories.
 ORT_EXPORT OrtStatus* CreateEpFactories(const char* registration_name,
                                         const OrtApiBase* ort_api_base,
                                         const OrtLogger* default_logger,
@@ -16,7 +16,7 @@ ORT_EXPORT OrtStatus* CreateEpFactories(const char* registration_name,
   const OrtEpApi* ep_api = ort_api->GetEpApi();
   const OrtModelEditorApi* model_editor_api = ort_api->GetModelEditorApi();
 
-  // Initialize C++ API (required when using ORT_API_MANUAL_INIT)
+  // Initialize C++ API (required when using ORT_API_MANUAL_INIT).
   Ort::InitApi(ort_api);
 
   if (max_factories < 1) {
@@ -24,7 +24,7 @@ ORT_EXPORT OrtStatus* CreateEpFactories(const char* registration_name,
                                  "Need at least one factory slot");
   }
 
-  // Create factory (use registration_name or "IREE")
+  // Create factory (use registration_name or "IREE").
   auto factory = std::make_unique<iree_onnx_ep::IreeEpFactory>(
       registration_name ? registration_name : "IREE",
       iree_onnx_ep::ApiPtrs{*ort_api, *ep_api, *model_editor_api},

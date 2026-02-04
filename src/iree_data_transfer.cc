@@ -3,6 +3,7 @@
 #include "iree_data_transfer.h"
 
 #include "iree/hal/buffer_transfer.h"
+#include "iree_ort_utils.h"
 
 namespace iree_onnx_ep {
 
@@ -37,6 +38,8 @@ bool ORT_API_CALL IreeDataTransfer::CanCopyImpl(
 
   // We can copy if either source or destination is our IREE device,
   // and the other is either our IREE device or CPU (vendor_id == 0).
+  // TODO: Is the vendor id check for CPU actually correct? Maybe we can check
+  // the hardware device for and determine if it's HOST/CPU.
   bool src_is_iree = (src_vendor_id == kEpVendorId);
   bool dst_is_iree = (dst_vendor_id == kEpVendorId);
   bool src_is_cpu = (src_vendor_id == 0);
@@ -98,33 +101,11 @@ OrtStatus* ORT_API_CALL IreeDataTransfer::CopyTensorsImpl(
     ONNXTensorElementDataType dtype = src_type_info.GetElementType();
 
     // Calculate byte size.
-    size_t element_size = 0;
-    switch (dtype) {
-      case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
-      case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:
-      case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32:
-        element_size = 4;
-        break;
-      case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE:
-      case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:
-      case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64:
-        element_size = 8;
-        break;
-      case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
-      case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:
-      case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16:
-      case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16:
-        element_size = 2;
-        break;
-      case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8:
-      case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8:
-      case ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL:
-        element_size = 1;
-        break;
-      default:
-        return Ort::Status("IREE EP: Unsupported tensor element type",
-                           ORT_NOT_IMPLEMENTED)
-            .release();
+    size_t element_size = OnnxElementTypeSize(dtype);
+    if (element_size == 0) {
+      return Ort::Status("IREE EP: Unsupported tensor element type",
+                         ORT_NOT_IMPLEMENTED)
+          .release();
     }
 
     size_t byte_size = element_count * element_size;
@@ -139,7 +120,7 @@ OrtStatus* ORT_API_CALL IreeDataTransfer::CopyTensorsImpl(
     if (src_is_iree && !dst_is_iree) {
       // Device to Host (D2H).
       // Source is an IREE buffer handle, destination is host memory.
-      iree_hal_buffer_t* src_buffer = static_cast<iree_hal_buffer_t*>(
+      auto* src_buffer = static_cast<iree_hal_buffer_t*>(
           const_cast<void*>(src_ort_value.GetTensorRawData()));
       void* dst_ptr = dst_ort_value.GetTensorMutableRawData();
 
@@ -160,7 +141,7 @@ OrtStatus* ORT_API_CALL IreeDataTransfer::CopyTensorsImpl(
       // Host to Device (H2D).
       // Source is host memory, destination is an IREE buffer handle.
       const void* src_ptr = src_ort_value.GetTensorRawData();
-      iree_hal_buffer_t* dst_buffer = static_cast<iree_hal_buffer_t*>(
+      auto* dst_buffer = static_cast<iree_hal_buffer_t*>(
           dst_ort_value.GetTensorMutableRawData());
 
       // Get the HAL device for the destination.
@@ -179,9 +160,9 @@ OrtStatus* ORT_API_CALL IreeDataTransfer::CopyTensorsImpl(
     } else if (src_is_iree && dst_is_iree) {
       // Device to Device (D2D).
       // Both are IREE buffer handles.
-      iree_hal_buffer_t* src_buffer = static_cast<iree_hal_buffer_t*>(
+      auto* src_buffer = static_cast<iree_hal_buffer_t*>(
           const_cast<void*>(src_ort_value.GetTensorRawData()));
-      iree_hal_buffer_t* dst_buffer = static_cast<iree_hal_buffer_t*>(
+      auto* dst_buffer = static_cast<iree_hal_buffer_t*>(
           dst_ort_value.GetTensorMutableRawData());
 
       // Use source device for the transfer.

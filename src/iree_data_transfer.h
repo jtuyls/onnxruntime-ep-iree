@@ -12,7 +12,6 @@
 
 namespace iree_onnx_ep {
 
-// Forward declaration.
 class IreeEpFactory;
 
 // Data transfer implementation for IREE execution provider.
@@ -21,7 +20,7 @@ class IreeEpFactory;
 // - Host (CPU) memory and IREE device memory (H2D, D2H)
 // - IREE device memory on the same device (D2D)
 //
-// All copies are currently synchronous. Async support will be added later.
+// TODO: Move to async implementation.
 class IreeDataTransfer : public OrtDataTransferImpl {
  public:
   // Creates a data transfer instance.
@@ -46,8 +45,7 @@ class IreeDataTransfer : public OrtDataTransferImpl {
   static void ORT_API_CALL ReleaseImpl(OrtDataTransferImpl* this_ptr) noexcept;
 
   // Checks if this implementation can copy between the specified devices.
-  // Returns true if either device is an IREE device (vendor_id == kEpVendorId)
-  // or host (vendor_id == 0).
+  // Returns true if either device is an IREE device or host.
   static bool ORT_API_CALL
   CanCopyImpl(const OrtDataTransferImpl* this_ptr,
               const OrtMemoryDevice* src_memory_device,

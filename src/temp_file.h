@@ -25,7 +25,7 @@ class TempFile {
   TempFile(const TempFile&) = delete;
   TempFile& operator=(const TempFile&) = delete;
 
-  const std::string& Path() const { return path_; }
+  [[nodiscard]] const std::string& Path() const { return path_; }
 
   // Marks the file to be kept (not deleted) when TempFile is destroyed.
   void Keep() { keep_ = true; }

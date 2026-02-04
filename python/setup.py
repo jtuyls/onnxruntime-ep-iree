@@ -1,48 +1,22 @@
 """Setup script for the iree-onnx-ep Python package.
 
-This package wraps a native shared library (the IREE Execution Provider plugin
-for ONNX Runtime) and provides Python helpers to locate it at runtime.
+Currently, we use IREE_ONNX_EP_BUILD_DIR to specify the build directory used by
+the developer to built the library. The library is built externally via cmake
+and not by this setup script. It is only required at install time, not at
+runtime. For editable installs, setup.py only validates the setup.py exists in
+the build directory, it doesn't copy or generate any files. At runtime,
+``get_library_path()`` finds the library by walking up from the package's
+source location to ``<project_root>/build/``. This means rebuilds are picked up
+immediately without reinstalling. For wheel builds (``pip wheel`` / ``pip
+install``), setup.py copies the library into the package directory so it is
+bundled in the wheel.
 
-Design decisions
-================
-
-Environment variable ``IREE_ONNX_EP_BUILD_DIR``
-    The native library is built externally via CMake, not by this setup script.
-    This environment variable tells setup.py where the pre-built library lives.
-    It is only required at *install* time, NOT at runtime.
-
-    For editable installs (``pip install -e``), setup.py only validates that the
-    library exists in the build directory — it does NOT copy the library or
-    generate any files.  At runtime, ``get_library_path()`` finds the library
-    by walking up from the package's source location to ``<project_root>/build/``.
-    This means rebuilds are picked up immediately without reinstalling.
-
-    For wheel builds (``pip wheel`` / ``pip install``), setup.py copies the
-    library into the package directory so it is bundled in the wheel.
-
-No generated files in the source tree
-    Unlike many packaging setups, we deliberately avoid writing any files into
-    the source tree (no copied libraries, no config files).  This keeps the
-    working directory clean for git.
-
-``BinaryDistribution``
-    We override ``has_ext_modules()`` to return True.  This forces setuptools to
-    generate platform-specific wheels (e.g. ``linux_x86_64``, ``macosx_arm64``)
-    instead of a universal ``py3-none-any`` wheel.  This is necessary because the
-    package contains a native shared library.
-
-``package_data``
-    Includes ``*.dylib``, ``*.so``, ``*.dll`` so that when the library IS copied
-    for wheel builds, it ends up in the installed package.
-
-Usage
-=====
-
-    # Editable install (development)
-    IREE_ONNX_EP_BUILD_DIR=/path/to/build uv pip install -e .
-
-    # Regular install / wheel build
-    IREE_ONNX_EP_BUILD_DIR=/path/to/build uv pip install .
+Note that this is a very temporary setup. We are never going to ship like this.
+The only reason we started out like this is because before this we were hardcoding
+library paths, which didn't work when trying to develop the library on macos
+vs linux (.dylib vs .so). We will eventually probably do something similar to
+shortfin, where we have a devme.py file to get things setup for dev workflow,
+and let the setup.py build a normal build and a tracy enabled build.
 """
 
 import os
@@ -93,6 +67,8 @@ if dst.resolve() != ep_lib_path.resolve():
 class BinaryDistribution(Distribution):
     """Mark the distribution as containing native code."""
 
+    # Force setuptools to generate platform-specific wheels, because the package
+    # contains a native shared library.
     def has_ext_modules(self):
         return True
 
@@ -102,6 +78,8 @@ setup(
     version="0.1.0",
     description="Python helpers for the IREE ONNX Runtime Execution Provider",
     packages=["iree_onnx_ep"],
+    # Includes ``*.dylib``, ``*.so``, ``*.dll`` so that when the library IS copied
+    # for wheel builds, it ends up in the installed package.
     package_data={
         "iree_onnx_ep": ["*.dylib", "*.so", "*.dll"],
     },

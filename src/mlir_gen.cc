@@ -12,6 +12,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include "iree_ort_utils.h"
+
 namespace iree_onnx_ep {
 namespace {
 
@@ -46,31 +48,6 @@ std::string Join(const std::vector<std::string>& parts,
     ss << parts[i];
   }
   return ss.str();
-}
-
-// Returns the byte size for an ONNX tensor element type.
-size_t GetElementByteSize(ONNXTensorElementDataType dtype) {
-  switch (dtype) {
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT32:
-      return 4;
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_DOUBLE:
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT64:
-      return 8;
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT16:
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT16:
-      return 2;
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8:
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_UINT8:
-    case ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL:
-      return 1;
-    default:
-      return 1;
-  }
 }
 
 // Returns MLIR element type string for an ONNX tensor element type.
@@ -452,9 +429,11 @@ class MlirGenerator {
       size_t size = tensor_value.GetTensorSizeInBytes();
 
       // Get alignment from element type (e.g., 4 for f32, 8 for f64).
+      // TODO: Error out on unsupported element types. The alignment
+      // currently would go to zero.
       auto tensor_info = init.TypeInfo().GetTensorTypeAndShapeInfo();
-      uint32_t alignment = static_cast<uint32_t>(
-          GetElementByteSize(tensor_info.GetElementType()));
+      auto alignment = static_cast<uint32_t>(
+          OnnxElementTypeSize(tensor_info.GetElementType()));
 
       // Build hex string: "0x" + alignment (4 bytes LE) + data bytes.
       std::string hex_str;

@@ -25,6 +25,8 @@ class IreeEp : public OrtEp, public ApiPtrs {
   struct Config {
     bool enable_ep_context = false;
     // Target architecture to compile for.
+    // TODO: Ideally, we want to get this from the device. I'm not sure how
+    // to do this in IREE.
     std::string target_arch = "";  // e.g., "gfx1100", "mi300x"
     // Optimization level for the IREE compiler: O0, O1, O2, O3
     std::string opt_level = "O0";
@@ -40,36 +42,34 @@ class IreeEp : public OrtEp, public ApiPtrs {
   ~IreeEp();
 
   // Accessor for the IREE device (from factory's device cache).
-  iree_hal_device_t* IreeDevice() const;
+  [[nodiscard]] iree_hal_device_t* IreeDevice() const;
 
   // Accessor for the logger.
-  const Ort::Logger& Logger() const { return logger_; }
+  [[nodiscard]] const Ort::Logger& Logger() const { return logger_; }
 
  private:
-  // EP interface implementations (called via function pointers)
+  // EP interface implementations (called via function pointers).
 
-  // Returns the EP name
+  // Returns the EP name.
   static const char* ORT_API_CALL GetNameImpl(const OrtEp* this_ptr) noexcept;
 
-  // Determines which nodes the EP can execute
-  // For now: claims ALL nodes (compile mode)
+  // Determines which nodes the EP can execute.
+  // For now: claims ALL nodes (compile mode).
   static OrtStatus* ORT_API_CALL
   GetCapabilityImpl(OrtEp* this_ptr, const OrtGraph* graph,
                     OrtEpGraphSupportInfo* graph_support_info) noexcept;
 
-  // Compiles fused subgraphs into executable code
-  // For now: fails with "not implemented"
+  // Compiles fused subgraphs into executable code.
   static OrtStatus* ORT_API_CALL CompileImpl(
       OrtEp* this_ptr, const OrtGraph** graphs, const OrtNode** fused_nodes,
       size_t count, OrtNodeComputeInfo** node_compute_infos,
       OrtNode** ep_context_nodes) noexcept;
 
-  // Releases node compute infos created in Compile
+  // Releases node compute infos created in Compile.
   static void ORT_API_CALL ReleaseNodeComputeInfosImpl(
       OrtEp* this_ptr, OrtNodeComputeInfo** node_compute_infos,
       size_t num_node_compute_infos) noexcept;
 
-  // Member variables
   IreeEpFactory& factory_;
   std::string name_;
   Config config_;
@@ -91,17 +91,17 @@ struct IreeNodeComputeInfo : OrtNodeComputeInfo {
 
   ~IreeNodeComputeInfo();
 
-  // Creates per-node computation state
+  // Creates per-node computation state.
   static OrtStatus* ORT_API_CALL CreateStateImpl(
       OrtNodeComputeInfo* this_ptr, OrtNodeComputeContext* compute_context,
       void** compute_state) noexcept;
 
-  // Executes the computation
+  // Executes the computation.
   static OrtStatus* ORT_API_CALL
   ComputeImpl(OrtNodeComputeInfo* this_ptr, void* compute_state,
               OrtKernelContext* kernel_context) noexcept;
 
-  // Releases computation state
+  // Releases computation state.
   static void ORT_API_CALL ReleaseStateImpl(OrtNodeComputeInfo* this_ptr,
                                             void* compute_state) noexcept;
 

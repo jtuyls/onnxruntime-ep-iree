@@ -21,7 +21,8 @@ namespace iree_onnx_ep {
 // Allocates device-local memory via IREE's HAL allocator. The Alloc() function
 // returns a pointer to an iree_hal_buffer_t (cast to void*), not the actual
 // device memory address. This handle is passed back to Free() when the memory
-// should be released.
+// should be released. This is similar to what the WebGPU EP does (passing
+// handles to memory instead of raw pointers like CUDA EP).
 //
 // The allocator owns all allocated buffers and tracks them internally for
 // proper cleanup. Buffers are automatically released when the allocator is
@@ -33,8 +34,9 @@ class IreeAllocator : public OrtAllocator {
   // Args:
   //   device_id: The IREE device ID (index in hw_devices_ list).
   //   device: Non-owning pointer to the HAL device. Must outlive this
-  //   allocator. memory_info: ORT memory info describing this allocator. Takes
-  //   ownership. logger: Logger for allocation tracing.
+  //   allocator.
+  //   memory_info: ORT memory info describing this allocator. Takes ownership.
+  //   logger: Logger for allocation tracing.
   IreeAllocator(uint32_t device_id, iree_hal_device_t* device,
                 const OrtMemoryInfo* memory_info, const Ort::Logger& logger);
 

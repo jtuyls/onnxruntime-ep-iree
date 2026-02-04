@@ -61,10 +61,10 @@ IreeEp::IreeEp(IreeEpFactory& factory, const std::string& name,
       config_(config),
       logger_(&logger),
       device_id_(device_id) {
-  // Set ORT version we support
+  // Set ORT version we support.
   ort_version_supported = ORT_API_VERSION;
 
-  // Set function pointers for EP interface
+  // Set function pointers for EP interface.
   GetName = GetNameImpl;
   GetCapability = GetCapabilityImpl;
   Compile = CompileImpl;
@@ -92,31 +92,31 @@ IreeEp::GetCapabilityImpl(OrtEp* this_ptr, const OrtGraph* ort_graph,
                           OrtEpGraphSupportInfo* graph_support_info) noexcept {
   auto* ep = static_cast<IreeEp*>(this_ptr);
 
-  // Use the C++ wrapper for easier API access
+  // Use the C++ wrapper for easier API access,
   Ort::ConstGraph graph{ort_graph};
 
-  // Get all nodes in the graph
+  // Get all nodes in the graph.
   std::vector<Ort::ConstNode> nodes = graph.GetNodes();
   if (nodes.empty()) {
-    return nullptr;  // Empty graph, nothing to claim
+    return nullptr;  // Empty graph, nothing to claim.
   }
 
-  // Collect all nodes - we claim the entire graph
+  // Collect all nodes - we claim the entire graph.
   std::vector<const OrtNode*> nodes_to_fuse;
   nodes_to_fuse.reserve(nodes.size());
   for (const auto& node : nodes) {
     nodes_to_fuse.push_back(node);
   }
 
-  // Create fusion options for compiling EP
+  // Create fusion options for compiling EP.
   OrtNodeFusionOptions node_fusion_options = {};
   node_fusion_options.ort_version_supported = ORT_API_VERSION;
 
-  // Drop constant initializers - EP will save them during Compile()
-  // This reduces memory usage and allows weight preprocessing
+  // Drop constant initializers - EP will save them during Compile().
+  // This reduces memory usage and allows weight preprocessing/
   node_fusion_options.drop_constant_initializers = true;
 
-  // Register all nodes as a single fused subgraph
+  // Register all nodes as a single fused subgraph.
   OrtStatus* status = ep->ep_api.EpGraphSupportInfo_AddNodesToFuse(
       graph_support_info, nodes_to_fuse.data(), nodes_to_fuse.size(),
       &node_fusion_options);

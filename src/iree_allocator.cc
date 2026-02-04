@@ -80,6 +80,9 @@ void* ORT_API_CALL IreeAllocator::AllocImpl(OrtAllocator* this_, size_t size) {
   }
 
   // Store in allocations map and return the buffer pointer.
+  // TODO: We probably don't need to do this. This just adds an extra layer of
+  // validation that when the pointer is freed, we actually owned it and free
+  // any unfreed memory on teardown.
   iree_hal_buffer_t* buffer_ptr = buffer.Get();
   self->allocations_[buffer_ptr] = std::move(buffer);
 
