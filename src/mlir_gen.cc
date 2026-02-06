@@ -341,6 +341,7 @@ class MlirGenerator {
     std::ostringstream out_names;
     std::ostringstream out_types;
     bool first_output = true;
+    size_t valid_output_count = 0;
     for (size_t i = 0; i < outputs.size(); ++i) {
       // Skip invalid outputs (optional outputs can be empty/null)
       // Check if the underlying pointer is valid before calling GetName()
@@ -357,6 +358,7 @@ class MlirGenerator {
         out_types << ", ";
       }
       first_output = false;
+      valid_output_count++;
       out_names << "%" << SanitizeName(output_name);
       out_types << FormatTensorType(outputs[i].TypeInfo());
     }
@@ -388,6 +390,12 @@ class MlirGenerator {
     // Build attributes.
     std::string attr_str = FormatAttributes(attrs);
 
+    // Format output types: wrap in parentheses if multiple outputs
+    std::string out_types_str = out_types.str();
+    if (valid_output_count > 1 && !out_types_str.empty()) {
+      out_types_str = "(" + out_types_str + ")";
+    }
+
     // Emit the operator.
     constexpr std::string_view schema =
         R"(    {0} = torch.operator "onnx.{1}"({2}) {{{3}}} : ({4}) -> {5}
@@ -398,7 +406,7 @@ class MlirGenerator {
                         in_names.str(),    // {2}
                         attr_str,          // {3}
                         in_types.str(),    // {4}
-                        out_types.str());  // {5}
+                        out_types_str);    // {5}
   }
 
   std::string FormatAttributes(const std::vector<Ort::ConstOpAttr>& attrs) {
