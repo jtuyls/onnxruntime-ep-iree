@@ -18,10 +18,10 @@ import test_utils
 np.random.seed(42)
 
 # Test data. Four initializers, each handled differently:
-#   D_small:     [1, 64] float32 = 256 bytes   -> inline dense_resource
+#   D_small:     [1, 64] float32 = 256 bytes   -> inline dense<>
 #   D_large:     [64, 64] float32 = 16384 bytes -> IRPA parameter
 #   D_ext:       [64, 64] float32 = 16384 bytes -> external file (parameter, not in IRPA)
-#   D_ext_small: [1, 64] float32 = 256 bytes    -> external file (inlined as dense_resource)
+#   D_ext_small: [1, 64] float32 = 256 bytes    -> external file (inlined as dense<>)
 # Graph: C = (((A + D_small) + D_large) + D_ext) + D_ext_small
 SHAPE = [64, 64]
 A_DATA = np.random.rand(*SHAPE).astype(np.float32)
@@ -74,7 +74,7 @@ def create_model():
     ext_tensor.ClearField("raw_data")
     ext_tensor.data_location = TensorProto.EXTERNAL
 
-    # Small external initializer (should be inlined as dense_resource).
+    # Small external initializer (should be inlined as dense<>).
     ext_small_filename = "ext_small_weights.bin"
     ext_small_path = os.path.join(model_dir, ext_small_filename)
     ext_small_tensor = from_array(B_EXT_SMALL, name="D_ext_small")
@@ -179,20 +179,17 @@ def test_with_save_intermediates():
 
         mlir_content = open(list(new_mlir)[0]).read()
 
-        # D_small and D_ext_small should be inlined via dense_resource.
-        if "dense_resource<D_small>" not in mlir_content:
-            print("FAIL: MLIR should contain dense_resource<D_small>")
+        # D_small and D_ext_small should be inlined via dense<>.
+        if 'dense<"0x' not in mlir_content:
+            print("FAIL: MLIR should contain inline dense<> attributes")
             return False
-        if "dense_resource<D_ext_small>" not in mlir_content:
-            print(
-                "FAIL: MLIR should contain dense_resource<D_ext_small> "
-                "(small external initializer should be inlined)"
-            )
+        if "dense_resource" in mlir_content:
+            print("FAIL: MLIR should not contain dense_resource (replaced by dense<>)")
             return False
-        if "dialect_resources" not in mlir_content:
-            print("FAIL: MLIR should contain dialect_resources section")
+        if "dialect_resources" in mlir_content:
+            print("FAIL: MLIR should not contain dialect_resources section")
             return False
-        print("  Small inits (D_small, D_ext_small): dense_resource present")
+        print("  Small inits (D_small, D_ext_small): inline dense<> present")
 
         # D_large and D_ext should use flow.parameter.named.
         if 'flow.parameter.named<"model"::"D_large">' not in mlir_content:

@@ -23,9 +23,22 @@
 namespace onnxruntime::iree {
 namespace {
 
-// Initializers smaller than this are inlined via dense_resource + dialect
-// resources. Larger ones become IREE parameters backed by an IRPA archive.
+// Initializers smaller than this are inlined via dense<> DenseElementsAttr.
+// Larger ones become IREE parameters backed by an IRPA archive.
 constexpr size_t kMaxInlineInitializerSize = 256;
+
+// Encodes raw bytes as a hex string: "0xAABBCC...".
+std::string HexEncode(const uint8_t* data, size_t size) {
+  constexpr char hex_chars[] = "0123456789abcdef";
+  std::string result;
+  result.reserve(2 + size * 2);
+  result = "0x";
+  for (size_t i = 0; i < size; ++i) {
+    result += hex_chars[(data[i] >> 4) & 0xF];
+    result += hex_chars[data[i] & 0xF];
+  }
+  return result;
+}
 
 // Tracks a large initializer that will become an IREE parameter.
 struct ParameterInitializer {
@@ -289,12 +302,12 @@ class MlirGenerator {
   }
 
   // Emits an initializer as a flow.tensor.constant with a
-  // torch_c.from_builtin_tensor cast. Small initializers use dense_resource
-  // (data emitted later in dialect_resources). Large initializers use
-  // #flow.parameter.named (data stored in IRPA archive).
+  // torch_c.from_builtin_tensor cast. Small initializers use dense<> with
+  // inline hex-encoded data. Large initializers use #flow.parameter.named
+  // (data stored in IRPA archive).
   //
   // Output format (small):
-  //   %__raw_name = flow.tensor.constant dense_resource<name> : tensor<...>
+  //   %__raw_name = flow.tensor.constant dense<"0x..."> : tensor<...>
   //   %name = torch_c.from_builtin_tensor %__raw_name : tensor<...>
   //       -> !torch.vtensor<[...],dtype>
   //
@@ -313,13 +326,21 @@ class MlirGenerator {
                        OnnxElementTypeSize(tensor_info.GetElementType());
 
     if (byte_size <= kMaxInlineInitializerSize) {
-      // Small: inline with dense_resource. Data emitted in dialect_resources.
+      // Small: inline with dense<> DenseElementsAttr.
+      Ort::ConstValue tensor_value{nullptr};
+      auto status = init.GetInitializer(tensor_value);
+      if (!status.IsOK()) {
+        return;
+      }
+      const auto* data =
+          static_cast<const uint8_t*>(tensor_value.GetTensorRawData());
+      std::string hex = HexEncode(data, tensor_value.GetTensorSizeInBytes());
+
       constexpr std::string_view schema =
-          R"(    %__raw_{0} = flow.tensor.constant dense_resource<{0}> : {1}
+          R"(    %__raw_{0} = flow.tensor.constant dense<"{3}"> : {1}
     %{0} = torch_c.from_builtin_tensor %__raw_{0} : {1} -> {2}
 )";
-      out_ << std::format(schema, name, tensor_type, vtensor_type);
-      inline_initializers_.insert(name);
+      out_ << std::format(schema, name, tensor_type, vtensor_type, hex);
     } else {
       // Large: parameter reference. Data stored in IRPA archive.
       constexpr std::string_view schema =
@@ -471,101 +492,9 @@ class MlirGenerator {
                         ret_types.str());
   }
 
-  // Emits the dialect_resources section containing the raw tensor data for all
-  // initializers. This section is appended after the module closing brace.
-  //
-  // Each initializer's data is encoded as a hex string with the following
-  // format (per MLIR's AsmResourceBlob specification):
-  //   - First 4 bytes: alignment as little-endian uint32 (e.g., 0x04000000 for
-  //     f32 which requires 4-byte alignment)
-  //   - Remaining bytes: raw tensor data in little-endian byte order
-  //
-  // Output format:
-  //   {-#
-  //     dialect_resources: {
-  //       builtin: {
-  //         name1: "0x04000000...",
-  //         name2: "0x08000000..."
-  //       }
-  //     }
-  //   #-}
-  void EmitDialectResources() {
-    if (inline_initializers_.empty()) {
-      return;
-    }
-
-    constexpr std::string_view header = R"(
-{-#
-  dialect_resources: {
-    builtin: {
-)";
-    out_ << header;
-
-    bool first = true;
-    for (const auto& init : initializers_) {
-      std::string name = SanitizeName(init.GetName());
-
-      // Only emit data for small inline initializers.
-      if (inline_initializers_.find(name) == inline_initializers_.end()) {
-        continue;
-      }
-
-      Ort::ConstValue tensor_value{nullptr};
-      auto status = init.GetInitializer(tensor_value);
-      if (!status.IsOK()) {
-        continue;
-      }
-
-      const auto* data =
-          static_cast<const uint8_t*>(tensor_value.GetTensorRawData());
-      size_t size = tensor_value.GetTensorSizeInBytes();
-
-      // Get alignment from element type (e.g., 4 for f32, 8 for f64).
-      // TODO: Error out on unsupported element types. The alignment
-      // currently would go to zero.
-      auto tensor_info = init.TypeInfo().GetTensorTypeAndShapeInfo();
-      auto alignment = static_cast<uint32_t>(
-          OnnxElementTypeSize(tensor_info.GetElementType()));
-
-      // Build hex string: "0x" + alignment (4 bytes LE) + data bytes.
-      std::string hex_str;
-      hex_str.reserve(2 + 8 + size * 2);
-      hex_str = "0x";
-      constexpr char hex_chars[] = "0123456789abcdef";
-
-      // Append alignment as little-endian 32-bit integer.
-      for (int i = 0; i < 4; ++i) {
-        uint8_t byte = (alignment >> (i * 8)) & 0xFF;
-        hex_str += hex_chars[(byte >> 4) & 0xF];
-        hex_str += hex_chars[byte & 0xF];
-      }
-
-      // Append raw tensor data bytes.
-      for (size_t i = 0; i < size; ++i) {
-        hex_str += hex_chars[(data[i] >> 4) & 0xF];
-        hex_str += hex_chars[data[i] & 0xF];
-      }
-
-      if (!first) {
-        out_ << ",\n";
-      }
-      first = false;
-
-      out_ << std::format("      {}: \"{}\"", name, hex_str);
-    }
-
-    constexpr std::string_view footer = R"(
-    }
-  }
-#-}
-)";
-    out_ << footer;
-  }
-
   void EmitModuleFooter() {
     out_ << "  }\n";
     out_ << "}\n";
-    EmitDialectResources();
   }
 
   // Member variables.
@@ -580,7 +509,6 @@ class MlirGenerator {
   std::vector<Ort::ConstValueInfo> graph_inputs_;
   std::vector<Ort::ConstValueInfo> graph_outputs_;
   std::vector<Ort::ConstValueInfo> initializers_;
-  std::unordered_set<std::string> inline_initializers_;
   std::vector<ParameterInitializer> parameter_initializers_;
 };
 
