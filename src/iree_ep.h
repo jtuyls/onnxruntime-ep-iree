@@ -55,6 +55,9 @@ class IreeEp : public OrtEp, public ApiPtrs {
   // Accessor for the logger.
   [[nodiscard]] const Ort::Logger& Logger() const { return logger_; }
 
+  // Returns the IreeAllocator for this EP's device.
+  [[nodiscard]] IreeAllocator* GetAllocator() const;
+
  private:
   // EP interface implementations (called via function pointers).
 

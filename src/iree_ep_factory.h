@@ -65,6 +65,10 @@ class IreeEpFactory : public OrtEpFactory, public ApiPtrs {
   // Accessor for the logger.
   const Ort::Logger& Logger() const { return logger_; }
 
+  // Returns the allocator for the given device ID, or nullptr if not yet
+  // created.
+  IreeAllocator* GetAllocatorForId(uint32_t device_id);
+
  private:
   // Factory interface implementations (called via function pointers)
   static const char* ORT_API_CALL

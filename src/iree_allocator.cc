@@ -44,6 +44,22 @@ IreeAllocator::~IreeAllocator() {
   // Allocations are automatically released via HalBufferPtr RAII.
 }
 
+void IreeAllocator::QueueBufferForReuse(iree_hal_buffer_t* buffer, size_t size) {
+  // TODO(thread-safety): std::lock_guard<std::mutex>
+  // lock(self->allocations_mutex_);
+  reuse_queue_.push({buffer, size});
+}
+
+void IreeAllocator::DrainReuseQueue() {
+  // TODO(thread-safety): std::lock_guard<std::mutex>
+  // lock(self->allocations_mutex_);
+  while (!reuse_queue_.empty()) {
+    auto pending = reuse_queue_.front();
+    reuse_queue_.pop();
+    iree_hal_buffer_release(pending.buffer);
+  }
+}
+
 /*static*/
 void* ORT_API_CALL IreeAllocator::AllocImpl(OrtAllocator* this_, size_t size) {
   auto* self = static_cast<IreeAllocator*>(this_);
@@ -53,6 +69,32 @@ void* ORT_API_CALL IreeAllocator::AllocImpl(OrtAllocator* this_, size_t size) {
 
   if (size == 0) {
     return nullptr;
+  }
+
+  // Check reuse queue first. If IREE produced an output buffer of the same
+  // size, reuse it directly instead of allocating new memory. This eliminates
+  // the D2D copy that would otherwise be needed.
+  if (!self->reuse_queue_.empty()) {
+    auto pending = self->reuse_queue_.front();
+    if (pending.size == size) {
+      self->reuse_queue_.pop();
+      // The buffer was already retained by the caller of QueueBufferForReuse.
+      // Take ownership via HalBufferPtr without an extra retain.
+      self->allocations_[pending.buffer] = HalBufferPtr(pending.buffer);
+
+      ORT_CXX_LOGF_NOEXCEPT(
+          self->logger_, ORT_LOGGING_LEVEL_INFO,
+          "IREE EP: Reusing output buffer for %zu bytes on device %u "
+          "(buffer=%p)",
+          size, self->device_id_, static_cast<void*>(pending.buffer));
+
+      return pending.buffer;
+    }
+    // Size mismatch — release the pending buffer and fall through to
+    // normal allocation. The caller will detect this via pointer comparison
+    // and fall back to a copy.
+    iree_hal_buffer_release(pending.buffer);
+    self->reuse_queue_.pop();
   }
 
   // Get the HAL allocator from the device.

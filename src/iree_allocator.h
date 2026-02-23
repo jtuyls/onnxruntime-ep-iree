@@ -16,6 +16,7 @@
 #ifndef ONNXRUNTIME_EP_IREE_SRC_IREE_ALLOCATOR_H_
 #define ONNXRUNTIME_EP_IREE_SRC_IREE_ALLOCATOR_H_
 
+#include <queue>
 #include <unordered_map>
 
 #include "iree_ep_factory.h"
@@ -56,6 +57,16 @@ class IreeAllocator : public OrtAllocator {
   IreeAllocator(IreeAllocator&&) = delete;
   IreeAllocator& operator=(IreeAllocator&&) = delete;
 
+  // Queue an IREE buffer for reuse by the next matching Alloc() call.
+  // The caller must have retained the buffer before calling this.
+  // If the buffer is not consumed by a subsequent Alloc() call,
+  // DrainReuseQueue() must be called to release it.
+  void QueueBufferForReuse(iree_hal_buffer_t* buffer, size_t size);
+
+  // Release any unconsumed buffers in the reuse queue.
+  // Must be called after the output processing loop to avoid buffer leaks.
+  void DrainReuseQueue();
+
  private:
   // OrtAllocator function pointer implementations.
 
@@ -79,6 +90,16 @@ class IreeAllocator : public OrtAllocator {
   // Value: RAII wrapper that releases buffer on destruction.
   // TODO(thread-safety): Add std::mutex for thread-safe access.
   std::unordered_map<void*, HalBufferPtr> allocations_;
+
+  // Queue of IREE output buffers available for reuse.
+  // Used to eliminate D2D copies: instead of allocating a new buffer and
+  // copying IREE's output into it, AllocImpl returns IREE's existing buffer
+  // directly when a matching size is found.
+  struct PendingBuffer {
+    iree_hal_buffer_t* buffer;
+    size_t size;
+  };
+  std::queue<PendingBuffer> reuse_queue_;
 };
 
 }  // namespace onnxruntime::iree

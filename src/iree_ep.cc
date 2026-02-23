@@ -13,10 +13,12 @@
 
 #include "iree_ep.h"
 
+#include <unordered_set>
 #include <vector>
 
 #include "iree/modules/io/parameters/module.h"
 #include "iree/runtime/api.h"
+#include "iree_allocator.h"
 #include "iree_compile.h"
 #include "iree_ep_factory.h"
 #include "iree_ort_utils.h"
@@ -87,6 +89,10 @@ IreeEp::~IreeEp() {
 
 iree_hal_device_t* IreeEp::IreeDevice() const {
   return factory_.GetDeviceForId(device_id_);
+}
+
+IreeAllocator* IreeEp::GetAllocator() const {
+  return factory_.GetAllocatorForId(device_id_);
 }
 
 /*static*/
@@ -330,17 +336,23 @@ OrtStatus* ORT_API_CALL IreeNodeComputeInfo::ComputeImpl(
   IREE_ORT_RETURN_IF_ERROR(
       iree_runtime_call_invoke(call.Get(), IREE_RUNTIME_CALL_FLAG_RESERVED));
 
-  // Pop outputs and copy to ORT tensors.
+  // Pop outputs and transfer to ORT tensors.
   //
-  // TODO(perf): Currently IREE allocates its own output buffers, then we copy
-  // to ORT's pre-allocated device buffers (D2D copy). The way to properly
-  // eliminate this is by passing mutable dps buffers as part of the iree input
-  // signature and writing to them. The problem is that ORT doesn't give us a
-  // good way to infer the output shape. I'm not sure what the right fix is.
-  // Maybe we could have a custom iree allocator that does the job for us?
-  // I'm just not sure how to do this properly.
+  // Zero-copy path: Instead of allocating a new ORT buffer and copying IREE's
+  // output into it (D2D copy), we queue IREE's output buffer for reuse in the
+  // IreeAllocator. When ctx.GetOutput() triggers an allocation, the allocator
+  // returns IREE's existing buffer directly — no copy needed.
+  //
+  // Fallback: If buffer reuse fails (e.g., size mismatch, host output, or
+  // allocator not available), we fall back to the standard copy path.
   iree_vm_list_t* output_list = iree_runtime_call_outputs(call.Get());
   iree_host_size_t output_count = iree_vm_list_size(output_list);
+  IreeAllocator* iree_allocator = info->ep.GetAllocator();
+
+  // Track which underlying buffers we've already queued for reuse in this
+  // invocation. Multiple outputs may alias the same buffer (e.g., Identity
+  // fan-out), and queueing the same buffer twice corrupts the allocations map.
+  std::unordered_set<iree_hal_buffer_t*> reused_buffers;
 
   for (size_t i = 0; i < output_count; ++i) {
     // Pop output buffer view.
@@ -356,16 +368,54 @@ OrtStatus* ORT_API_CALL IreeNodeComputeInfo::ComputeImpl(
     ONNXTensorElementDataType onnx_dtype = IreeToOnnxElementType(iree_dtype);
 
     if (onnx_dtype == ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED) {
+      if (iree_allocator) iree_allocator->DrainReuseQueue();
       return Ort::Status("IREE EP: Unsupported output element type",
                          ORT_NOT_IMPLEMENTED)
           .release();
     }
 
-    // Allocate ORT output tensor and copy data from IREE buffer.
+    // Get IREE's output buffer and byte size.
+    iree_hal_buffer_t* iree_buffer = iree_hal_buffer_view_buffer(output_view);
+    iree_device_size_t byte_size =
+        iree_hal_buffer_view_byte_length(output_view);
+
+    // Try zero-copy: retain IREE's buffer and queue it for reuse.
+    // Skip if this buffer was already reused by a prior output (aliased
+    // buffers). Each ORT output needs its own distinct buffer.
+    bool try_reuse =
+        iree_allocator && reused_buffers.find(iree_buffer) == reused_buffers.end();
+    if (try_reuse) {
+      iree_hal_buffer_retain(iree_buffer);
+      iree_allocator->QueueBufferForReuse(iree_buffer,
+                                          static_cast<size_t>(byte_size));
+    }
+
+    // Allocate ORT output tensor. If the allocator has a queued buffer of
+    // matching size, it returns that buffer directly (zero-copy).
     Ort::UnownedValue output = ctx.GetOutput(i, shape.data(), shape.size());
-    ORT_RETURN_IF_ERROR(IreeBufferViewToOrtTensor(
-        output_view, output, device, info->ep.ep_api, info->ep.Logger()));
+
+    // Check if reuse succeeded by comparing buffer pointers.
+    void* ort_buffer_ptr = output.GetTensorMutableRawData();
+    if (try_reuse && ort_buffer_ptr == static_cast<void*>(iree_buffer)) {
+      reused_buffers.insert(iree_buffer);
+      ORT_CXX_LOGF_NOEXCEPT(
+          info->ep.Logger(), ORT_LOGGING_LEVEL_INFO,
+          "IREE EP: Output %zu zero-copy reuse (%zu bytes)", i,
+          static_cast<size_t>(byte_size));
+    } else {
+      // Reuse failed or skipped — fall back to copy.
+      ORT_CXX_LOGF_NOEXCEPT(
+          info->ep.Logger(), ORT_LOGGING_LEVEL_INFO,
+          "IREE EP: Output %zu fallback copy (%zu bytes)", i,
+          static_cast<size_t>(byte_size));
+      ORT_RETURN_IF_ERROR(IreeBufferViewToOrtTensor(
+          output_view, output, device, info->ep.ep_api, info->ep.Logger()));
+    }
   }
+
+  // Release any unconsumed buffers in the reuse queue.
+  if (iree_allocator) iree_allocator->DrainReuseQueue();
+
   return nullptr;
 }
 

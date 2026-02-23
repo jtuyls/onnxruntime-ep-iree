@@ -217,6 +217,14 @@ iree_hal_device_t* IreeEpFactory::GetDeviceForId(uint32_t device_id) {
   return device_ptr;
 }
 
+IreeAllocator* IreeEpFactory::GetAllocatorForId(uint32_t device_id) {
+  auto it = allocators_.find(device_id);
+  if (it != allocators_.end()) {
+    return it->second.get();
+  }
+  return nullptr;
+}
+
 // Factory interface implementations
 
 /*static*/
