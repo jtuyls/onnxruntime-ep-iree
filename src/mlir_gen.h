@@ -35,11 +35,18 @@ namespace onnxruntime::iree {
 // parameter references and their data is written to an IRPA archive at
 // irpa_path. out_index and out_provider are populated with the parameter index
 // and provider for the archive. They remain null if no parameters are needed.
+//
+// When archive_external_data is true, external initializer data is copied into
+// the IRPA archive, making it self-contained. This is required for EPContext
+// caching where original model files may not be available at reload time.
+// When false (default), external initializers reference their original files
+// directly, avoiding unnecessary I/O and temp disk usage.
 OrtStatus* GenerateMlir(const Ort::ConstGraph& graph, const OrtApi& ort_api,
                         const std::string& mlir_path,
                         const std::string& irpa_path,
                         ParameterIndexPtr& out_index,
-                        ParameterProviderPtr& out_provider);
+                        ParameterProviderPtr& out_provider,
+                        bool archive_external_data = false);
 
 }  // namespace onnxruntime::iree
 

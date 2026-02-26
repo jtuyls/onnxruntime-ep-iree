@@ -13,9 +13,12 @@
 
 #include "iree_ep.h"
 
+#include <filesystem>
 #include <fstream>
 #include <vector>
 
+#include "iree/io/formats/irpa/irpa_parser.h"
+#include "iree/io/parameter_index_provider.h"
 #include "iree/modules/io/parameters/module.h"
 #include "iree/runtime/api.h"
 #include "iree_compile.h"
@@ -100,13 +103,26 @@ const char* ORT_API_CALL IreeEp::GetNameImpl(const OrtEp* this_ptr) noexcept {
   return ep->name_.c_str();
 }
 
+// Returns true if the node is an EPContext node created by this EP.
+static bool IsIreeEpContextNode(const Ort::ConstNode& node) {
+  return node.GetOperatorType() == kEpContextOpType &&
+         node.GetDomain() == kEpContextDomain && [&]() {
+           Ort::ConstOpAttr source_attr;
+           auto status = node.GetAttributeByName("source", source_attr);
+           if (!status.IsOK() || !source_attr) return false;
+           std::string source;
+           status = source_attr.GetValue<std::string>(source);
+           return status.IsOK() && source == kEpContextSource;
+         }();
+}
+
 /*static*/
 OrtStatus* ORT_API_CALL
 IreeEp::GetCapabilityImpl(OrtEp* this_ptr, const OrtGraph* ort_graph,
                           OrtEpGraphSupportInfo* graph_support_info) noexcept {
   auto* ep = static_cast<IreeEp*>(this_ptr);
 
-  // Use the C++ wrapper for easier API access,
+  // Use the C++ wrapper for easier API access.
   Ort::ConstGraph graph{ort_graph};
 
   // Get all nodes in the graph.
@@ -115,7 +131,24 @@ IreeEp::GetCapabilityImpl(OrtEp* this_ptr, const OrtGraph* ort_graph,
     return nullptr;  // Empty graph, nothing to claim.
   }
 
-  // Collect all nodes - we claim the entire graph.
+  // Check if this is a pre-compiled EPContext model (loading path).
+  // An EPContext model has a single EPContext node created by this EP.
+  if (nodes.size() == 1 && IsIreeEpContextNode(nodes[0])) {
+    ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
+                         "IREE EP: Detected EPContext model (loading path)");
+
+    std::vector<const OrtNode*> nodes_to_fuse = {nodes[0]};
+    OrtNodeFusionOptions node_fusion_options = {};
+    node_fusion_options.ort_version_supported = ORT_API_VERSION;
+    // EPContext model has no initializers to drop.
+    node_fusion_options.drop_constant_initializers = false;
+
+    return ep->ep_api.EpGraphSupportInfo_AddNodesToFuse(
+        graph_support_info, nodes_to_fuse.data(), nodes_to_fuse.size(),
+        &node_fusion_options);
+  }
+
+  // Normal path: claim the entire graph for compilation.
   std::vector<const OrtNode*> nodes_to_fuse;
   nodes_to_fuse.reserve(nodes.size());
   for (const auto& node : nodes) {
@@ -127,29 +160,281 @@ IreeEp::GetCapabilityImpl(OrtEp* this_ptr, const OrtGraph* ort_graph,
   node_fusion_options.ort_version_supported = ORT_API_VERSION;
 
   // Drop constant initializers - EP will save them during Compile().
-  // This reduces memory usage and allows weight preprocessing/
+  // This reduces memory usage and allows weight preprocessing.
   node_fusion_options.drop_constant_initializers = true;
 
   // Register all nodes as a single fused subgraph.
-  OrtStatus* status = ep->ep_api.EpGraphSupportInfo_AddNodesToFuse(
+  return ep->ep_api.EpGraphSupportInfo_AddNodesToFuse(
       graph_support_info, nodes_to_fuse.data(), nodes_to_fuse.size(),
       &node_fusion_options);
-
-  return status;
 }
 
-/*static*/
-OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
-    OrtEp* this_ptr, const OrtGraph** graphs, const OrtNode** /*fused_nodes*/,
-    size_t count, OrtNodeComputeInfo** node_compute_infos,
-    OrtNode** /*ep_context_nodes*/) noexcept {
-  auto* ep = static_cast<IreeEp*>(this_ptr);
+// Reads a binary file into a byte vector.
+static OrtStatus* ReadFileToBytes(const std::string& path,
+                                  std::vector<uint8_t>& out) {
+  std::ifstream stream(path, std::ios::binary | std::ios::ate);
+  if (!stream) {
+    return Ort::Status(("IREE EP: Failed to open file: " + path).c_str(),
+                       ORT_FAIL)
+        .release();
+  }
+  std::streampos pos = stream.tellg();
+  if (pos == std::streampos(-1) || pos <= 0) {
+    return Ort::Status(
+               ("IREE EP: Failed to determine file size: " + path).c_str(),
+               ORT_FAIL)
+        .release();
+  }
+  auto size = static_cast<size_t>(pos);
+  stream.seekg(0, std::ios::beg);
+  out.resize(size);
+  if (!stream.read(reinterpret_cast<char*>(out.data()),
+                   static_cast<std::streamsize>(size))) {
+    return Ort::Status(("IREE EP: Failed to read file: " + path).c_str(),
+                       ORT_FAIL)
+        .release();
+  }
+  return nullptr;
+}
 
-  if (count == 0 || graphs == nullptr) {
-    return Ort::Status("IREE EP: No graphs provided to compile.",
+// Copies a file from src to dst.
+static OrtStatus* CopyFile(const std::string& src, const std::string& dst) {
+  std::error_code ec;
+  std::filesystem::copy_file(
+      src, dst, std::filesystem::copy_options::overwrite_existing, ec);
+  if (ec) {
+    return Ort::Status(("IREE EP: Failed to copy " + src + " to " + dst + ": " +
+                        ec.message())
+                           .c_str(),
+                       ORT_FAIL)
+        .release();
+  }
+  return nullptr;
+}
+
+// Reads a string attribute from an EPContext node.
+static OrtStatus* ReadEpContextStringAttr(const Ort::ConstNode& node,
+                                          const char* attr_name,
+                                          std::string& out) {
+  Ort::ConstOpAttr attr;
+  auto status = node.GetAttributeByName(attr_name, attr);
+  if (!status.IsOK()) {
+    return Ort::Status(
+               ("IREE EP: Failed to get attribute '" + std::string(attr_name) +
+                "': " + status.GetErrorMessage())
+                   .c_str(),
+               ORT_FAIL)
+        .release();
+  }
+  if (!attr) {
+    return Ort::Status(("IREE EP: Missing required attribute '" +
+                        std::string(attr_name) + "'")
+                           .c_str(),
+                       ORT_FAIL)
+        .release();
+  }
+  status = attr.GetValue<std::string>(out);
+  if (!status.IsOK()) {
+    return Ort::Status(
+               ("IREE EP: Failed to read attribute '" + std::string(attr_name) +
+                "': " + status.GetErrorMessage())
+                   .c_str(),
+               ORT_FAIL)
+        .release();
+  }
+  return nullptr;
+}
+
+// Loads IRPA from file and creates parameter index + provider.
+static OrtStatus* LoadIrpaFromFile(const std::string& irpa_path,
+                                   ParameterIndexPtr& out_index,
+                                   ParameterProviderPtr& out_provider) {
+  iree_allocator_t allocator = iree_allocator_system();
+
+  // Open the IRPA file.
+  FileHandlePtr file_handle;
+  IREE_ORT_RETURN_IF_ERROR(iree_io_file_handle_open(
+      IREE_IO_FILE_MODE_READ,
+      iree_make_string_view(irpa_path.data(), irpa_path.size()), allocator,
+      file_handle.ForOutput()));
+
+  // Create parameter index and parse IRPA into it.
+  ParameterIndexPtr index;
+  IREE_ORT_RETURN_IF_ERROR(
+      iree_io_parameter_index_create(allocator, index.ForOutput()));
+  IREE_ORT_RETURN_IF_ERROR(
+      iree_io_parse_irpa_index(file_handle.Get(), index.Get(), allocator));
+
+  // Create provider from index.
+  ParameterProviderPtr provider;
+  IREE_ORT_RETURN_IF_ERROR(iree_io_parameter_index_provider_create(
+      iree_make_cstring_view("model"), index.Get(),
+      IREE_IO_PARAMETER_INDEX_PROVIDER_DEFAULT_MAX_CONCURRENT_OPERATIONS,
+      allocator, provider.ForOutput()));
+
+  out_index = std::move(index);
+  out_provider = std::move(provider);
+  return nullptr;
+}
+
+// Determines the base path for EPContext external files.
+// If ep_context_file_path is set, uses its stem. Otherwise derives from the
+// original model path by appending "_ctx".
+static std::filesystem::path GetEpContextBasePath(
+    const Ort::ConstGraph& graph, const IreeEp::Config& config) {
+  if (!config.ep_context_file_path.empty()) {
+    std::filesystem::path ctx_path(config.ep_context_file_path);
+    return ctx_path.parent_path() / ctx_path.stem();
+  }
+  // Derive from original model path: model.onnx -> model_ctx
+  std::filesystem::path model_path(graph.GetModelPath());
+  return model_path.parent_path() / (model_path.stem().string() + "_ctx");
+}
+
+// Creates an EPContext node for the generation path.
+// Uses Ort::Node C++ wrapper which handles attribute ownership transfer.
+static OrtStatus* CreateEpContextNode(const Ort::ConstNode& fused_node,
+                                      const std::string& vmfb_filename,
+                                      const std::string& irpa_filename,
+                                      const std::string& function_name,
+                                      OrtNode** out_node) {
+  // Get fused node input/output names.
+  std::vector<Ort::ConstValueInfo> inputs = fused_node.GetInputs();
+  std::vector<Ort::ConstValueInfo> outputs = fused_node.GetOutputs();
+
+  std::vector<std::string> input_names, output_names;
+  input_names.reserve(inputs.size());
+  output_names.reserve(outputs.size());
+  for (const auto& vi : inputs) input_names.push_back(vi.GetName());
+  for (const auto& vi : outputs) output_names.push_back(vi.GetName());
+
+  // Create attributes.
+  std::string source(kEpContextSource);
+  int64_t embed_mode = 0;  // external files
+  int64_t main_context = 1;
+
+  std::vector<Ort::OpAttr> attrs;
+  attrs.push_back(Ort::OpAttr("source", source.data(),
+                              static_cast<int>(source.size()),
+                              ORT_OP_ATTR_STRING));
+  attrs.push_back(Ort::OpAttr("embed_mode", &embed_mode, 1, ORT_OP_ATTR_INT));
+  attrs.push_back(
+      Ort::OpAttr("main_context", &main_context, 1, ORT_OP_ATTR_INT));
+  attrs.push_back(Ort::OpAttr("ep_cache_context", vmfb_filename.data(),
+                              static_cast<int>(vmfb_filename.size()),
+                              ORT_OP_ATTR_STRING));
+  // Only set iree_parameters_path if an IRPA file exists (small models may
+  // inline all weights and not produce an IRPA).
+  if (!irpa_filename.empty()) {
+    attrs.push_back(Ort::OpAttr("iree_parameters_path", irpa_filename.data(),
+                                static_cast<int>(irpa_filename.size()),
+                                ORT_OP_ATTR_STRING));
+  }
+  // Store the IREE function name for lookup at load time.
+  attrs.push_back(Ort::OpAttr("iree_function_name", function_name.data(),
+                              static_cast<int>(function_name.size()),
+                              ORT_OP_ATTR_STRING));
+
+  std::string fused_name = fused_node.GetName();
+
+  // Ort::Node constructor calls CreateNode and takes ownership of attributes.
+  // Wrap in try-catch since Ort::Node constructor throws on error and we need
+  // to return OrtStatus* from the noexcept CompileImpl call chain.
+  try {
+    Ort::Node node(kEpContextOpType, kEpContextDomain, fused_name, input_names,
+                   output_names, attrs);
+    // Transfer ownership to the output parameter (ORT takes ownership).
+    *out_node = node.release();
+  } catch (const Ort::Exception& e) {
+    return Ort::Status(e.what(), ORT_FAIL).release();
+  }
+  return nullptr;
+}
+
+// CompileImpl: EPContext loading path.
+// Loads cached VMFB and IRPA from external files referenced by the EPContext
+// node, skipping MLIR generation and iree-compile entirely.
+static OrtStatus* CompileEpContextPath(
+    IreeEp* ep, const Ort::ConstGraph& graph,
+    OrtNodeComputeInfo** node_compute_infos) {
+  // Get the single EPContext node.
+  std::vector<Ort::ConstNode> nodes = graph.GetNodes();
+  if (nodes.size() != 1) {
+    return Ort::Status("IREE EP: Expected single EPContext node",
                        ORT_INVALID_ARGUMENT)
         .release();
   }
+  const Ort::ConstNode& node = nodes[0];
+
+  // Read VMFB path (required) and IRPA path (optional).
+  std::string vmfb_filename;
+  ORT_RETURN_IF_ERROR(
+      ReadEpContextStringAttr(node, "ep_cache_context", vmfb_filename));
+
+  // IRPA is optional — small models may inline all weights.
+  std::string irpa_filename;
+  {
+    Ort::ConstOpAttr irpa_attr;
+    auto status = node.GetAttributeByName("iree_parameters_path", irpa_attr);
+    if (status.IsOK() && irpa_attr) {
+      irpa_attr.GetValue<std::string>(irpa_filename);
+    }
+  }
+
+  // Resolve paths relative to the context model directory.
+  std::filesystem::path model_dir =
+      std::filesystem::path(graph.GetModelPath()).parent_path();
+  std::string vmfb_path = (model_dir / vmfb_filename).string();
+
+  ORT_CXX_LOGF_NOEXCEPT(ep->Logger(), ORT_LOGGING_LEVEL_INFO,
+                        "IREE EP: Loading cached VMFB from: %s",
+                        vmfb_path.c_str());
+
+  // Load VMFB bytes.
+  std::vector<uint8_t> vmfb_data;
+  ORT_RETURN_IF_ERROR(ReadFileToBytes(vmfb_path, vmfb_data));
+
+  // Load IRPA into parameter index + provider (if present).
+  ParameterIndexPtr parameter_index;
+  ParameterProviderPtr parameter_provider;
+  if (!irpa_filename.empty()) {
+    std::string irpa_path = (model_dir / irpa_filename).string();
+    ORT_CXX_LOGF_NOEXCEPT(ep->Logger(), ORT_LOGGING_LEVEL_INFO,
+                          "IREE EP: Loading cached IRPA from: %s",
+                          irpa_path.c_str());
+    ORT_RETURN_IF_ERROR(
+        LoadIrpaFromFile(irpa_path, parameter_index, parameter_provider));
+  }
+
+  // Read function name from EPContext attribute, or default to "module.main".
+  std::string function_name = "module.main";
+  {
+    Ort::ConstOpAttr fn_attr;
+    auto status = node.GetAttributeByName("iree_function_name", fn_attr);
+    if (status.IsOK() && fn_attr) {
+      fn_attr.GetValue<std::string>(function_name);
+    }
+  }
+
+  // Create NodeComputeInfo with loaded artifacts.
+  auto* info = new IreeNodeComputeInfo(
+      *ep, std::move(vmfb_data), std::move(parameter_index),
+      std::move(parameter_provider), std::move(function_name));
+  node_compute_infos[0] = info;
+
+  ORT_CXX_LOG_NOEXCEPT(
+      ep->Logger(), ORT_LOGGING_LEVEL_INFO,
+      "IREE EP: EPContext loading complete (skipped compilation)");
+  return nullptr;
+}
+
+// CompileImpl: Normal compilation path.
+// Generates MLIR, compiles to VMFB, optionally creates EPContext node.
+static OrtStatus* CompileNormalPath(IreeEp* ep, const Ort::ConstGraph& graph,
+                                    const OrtNode* fused_node,
+                                    OrtNodeComputeInfo** node_compute_infos,
+                                    OrtNode** ep_context_nodes) {
+  const auto& config = ep->GetConfig();
 
   // Create temp files for intermediate artifacts.
   TempFile mlir_file(".mlir");
@@ -157,83 +442,90 @@ OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
   TempFile irpa_file(".irpa");
 
   // save_intermediates: keep all artifacts on disk for debugging/inspection.
-  if (ep->config_.save_intermediates) {
+  if (config.save_intermediates) {
     mlir_file.Keep();
     vmfb_file.Keep();
     irpa_file.Keep();
-    ORT_CXX_LOGF_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
+    ORT_CXX_LOGF_NOEXCEPT(ep->Logger(), ORT_LOGGING_LEVEL_INFO,
                           "IREE EP: Saving MLIR to: %s",
                           mlir_file.Path().c_str());
-    ORT_CXX_LOGF_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
+    ORT_CXX_LOGF_NOEXCEPT(ep->Logger(), ORT_LOGGING_LEVEL_INFO,
                           "IREE EP: Saving VMFB to: %s",
                           vmfb_file.Path().c_str());
-    ORT_CXX_LOGF_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
+    ORT_CXX_LOGF_NOEXCEPT(ep->Logger(), ORT_LOGGING_LEVEL_INFO,
                           "IREE EP: Saving IRPA to: %s",
                           irpa_file.Path().c_str());
   }
 
-  // enable_ep_context_cache: keep only compiled artifacts (VMFB, IRPA) needed
-  // for caching. MLIR is a transient intermediate — only the final compiled
-  // artifacts are needed to skip recompilation on subsequent runs.
-  if (!ep->config_.save_intermediates && ep->config_.enable_ep_context_cache) {
-    vmfb_file.Keep();
-    irpa_file.Keep();
-    ORT_CXX_LOGF_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
-                          "IREE EP: Saving VMFB to: %s",
-                          vmfb_file.Path().c_str());
-    ORT_CXX_LOGF_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
-                          "IREE EP: Saving IRPA to: %s",
-                          irpa_file.Path().c_str());
-  }
-
-  // Phase 1: Generate MLIR from the first graph.
+  // Phase 1: Generate MLIR from the graph.
   // Also builds an IRPA parameter archive for large initializers.
-  // TODO: Do we need to handle multiple graphs?
-  Ort::ConstGraph graph{graphs[0]};
   ParameterIndexPtr parameter_index;
   ParameterProviderPtr parameter_provider;
-  ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
+  ORT_CXX_LOG_NOEXCEPT(ep->Logger(), ORT_LOGGING_LEVEL_INFO,
                        "IREE EP: Generating MLIR");
-  ORT_RETURN_IF_ERROR(GenerateMlir(graph, ep->ort_api, mlir_file.Path(),
-                                   irpa_file.Path(), parameter_index,
-                                   parameter_provider));
-  ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
+  ORT_RETURN_IF_ERROR(GenerateMlir(
+      graph, ep->ort_api, mlir_file.Path(), irpa_file.Path(), parameter_index,
+      parameter_provider, config.ep_context_enable));
+  ORT_CXX_LOG_NOEXCEPT(ep->Logger(), ORT_LOGGING_LEVEL_INFO,
                        "IREE EP: MLIR Generated Successfully");
 
   // Phase 2: Compile MLIR to VMFB.
-  std::vector<std::string> flags = GenerateCompileFlags(ep->config_);
-  ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
+  std::vector<std::string> flags = GenerateCompileFlags(config);
+  ORT_CXX_LOG_NOEXCEPT(ep->Logger(), ORT_LOGGING_LEVEL_INFO,
                        "IREE EP: Generating VMFB");
   ORT_RETURN_IF_ERROR(
       CompileToVmfb(mlir_file.Path(), vmfb_file.Path(), flags, ep->ort_api));
-  ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
+  ORT_CXX_LOG_NOEXCEPT(ep->Logger(), ORT_LOGGING_LEVEL_INFO,
                        "IREE EP: VMFB Generated Successfully");
 
-  // Read VMFB into memory. Session creation is deferred to first execution,
-  // which allows the VMFB to be cached and loaded on a different device.
-  std::ifstream vmfb_stream(vmfb_file.Path(), std::ios::binary | std::ios::ate);
-  if (!vmfb_stream) {
-    return Ort::Status("IREE EP: Failed to open VMFB file", ORT_FAIL).release();
-  }
-  std::streampos vmfb_pos = vmfb_stream.tellg();
-  if (vmfb_pos == std::streampos(-1) || vmfb_pos <= 0) {
-    return Ort::Status("IREE EP: Failed to determine VMFB file size", ORT_FAIL)
-        .release();
-  }
-  auto vmfb_size = static_cast<size_t>(vmfb_pos);
-  vmfb_stream.seekg(0, std::ios::beg);
-  std::vector<uint8_t> vmfb_data(vmfb_size);
-  if (!vmfb_stream.read(reinterpret_cast<char*>(vmfb_data.data()),
-                        static_cast<std::streamsize>(vmfb_size))) {
-    return Ort::Status("IREE EP: Failed to read VMFB file contents", ORT_FAIL)
-        .release();
-  }
+  // Phase 3: Read VMFB into memory.
+  std::vector<uint8_t> vmfb_data;
+  ORT_RETURN_IF_ERROR(ReadFileToBytes(vmfb_file.Path(), vmfb_data));
 
   // Build function name for later lookup.
   // Format: "module.{graph_name}" (defaults to "main" if empty).
   std::string graph_name = graph.GetName();
   std::string function_name =
       "module." + (graph_name.empty() ? std::string("main") : graph_name);
+
+  // Phase 4: If EPContext generation is enabled, save external files and create
+  // the EPContext node for ORT to serialize into the context model.
+  if (config.ep_context_enable && ep_context_nodes != nullptr) {
+    std::filesystem::path base_path = GetEpContextBasePath(graph, config);
+    std::string vmfb_dest = base_path.string() + ".vmfb";
+
+    ORT_CXX_LOGF_NOEXCEPT(ep->Logger(), ORT_LOGGING_LEVEL_INFO,
+                          "IREE EP: Saving EPContext VMFB to: %s",
+                          vmfb_dest.c_str());
+
+    // Copy compiled artifacts to their permanent locations.
+    ORT_RETURN_IF_ERROR(CopyFile(vmfb_file.Path(), vmfb_dest));
+
+    // Copy IRPA only if parameters were generated (large models with
+    // externalized weights). Small models inline all weights in MLIR.
+    std::string irpa_filename;
+    if (parameter_index) {
+      std::string irpa_dest = base_path.string() + ".irpa";
+      ORT_CXX_LOGF_NOEXCEPT(ep->Logger(), ORT_LOGGING_LEVEL_INFO,
+                            "IREE EP: Saving EPContext IRPA to: %s",
+                            irpa_dest.c_str());
+      ORT_RETURN_IF_ERROR(CopyFile(irpa_file.Path(), irpa_dest));
+      irpa_filename = std::filesystem::path(irpa_dest).filename().string();
+    }
+
+    // Filenames (not paths) stored in EPContext attributes. These are resolved
+    // relative to the context model's directory at load time.
+    std::string vmfb_filename =
+        std::filesystem::path(vmfb_dest).filename().string();
+
+    Ort::ConstNode fused_node_wrapper{fused_node};
+    ORT_RETURN_IF_ERROR(CreateEpContextNode(fused_node_wrapper, vmfb_filename,
+                                            irpa_filename, function_name,
+                                            &ep_context_nodes[0]));
+
+    ORT_CXX_LOG_NOEXCEPT(ep->Logger(), ORT_LOGGING_LEVEL_INFO,
+                         "IREE EP: EPContext node created");
+  }
 
   // Create NodeComputeInfo with compiled artifacts. Session creation and VMFB
   // loading are deferred to first ComputeImpl call (lazy initialization).
@@ -242,9 +534,36 @@ OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
       std::move(parameter_provider), std::move(function_name));
   node_compute_infos[0] = info;
 
-  ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
+  ORT_CXX_LOG_NOEXCEPT(ep->Logger(), ORT_LOGGING_LEVEL_INFO,
                        "IREE EP: Compilation complete");
   return nullptr;
+}
+
+/*static*/
+OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
+    OrtEp* this_ptr, const OrtGraph** graphs, const OrtNode** fused_nodes,
+    size_t count, OrtNodeComputeInfo** node_compute_infos,
+    OrtNode** ep_context_nodes) noexcept {
+  auto* ep = static_cast<IreeEp*>(this_ptr);
+
+  if (count == 0 || graphs == nullptr) {
+    return Ort::Status("IREE EP: No graphs provided to compile.",
+                       ORT_INVALID_ARGUMENT)
+        .release();
+  }
+
+  // TODO: Handle multiple graphs (count > 1).
+  Ort::ConstGraph graph{graphs[0]};
+
+  // Check if this is an EPContext loading path.
+  std::vector<Ort::ConstNode> nodes = graph.GetNodes();
+  if (nodes.size() == 1 && IsIreeEpContextNode(nodes[0])) {
+    return CompileEpContextPath(ep, graph, node_compute_infos);
+  }
+
+  // Normal compilation path.
+  return CompileNormalPath(ep, graph, fused_nodes[0], node_compute_infos,
+                           ep_context_nodes);
 }
 
 /*static*/

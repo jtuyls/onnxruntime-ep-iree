@@ -208,8 +208,13 @@ class MlirGenerator {
   // Builds an IRPA parameter archive for large initializers and creates a
   // parameter provider. Call after Generate(). If no parameters are needed,
   // the output pointers remain null.
+  //
+  // When archive_external_data is true, external initializer data is copied
+  // into the IRPA archive (required for EPContext self-containment).
+  // When false, external initializers reference their original files directly.
   OrtStatus* BuildParameterArchive(ParameterIndexPtr& out_index,
-                                   ParameterProviderPtr& out_provider);
+                                   ParameterProviderPtr& out_provider,
+                                   bool archive_external_data = false);
 
  private:
   void CollectMetadata() {
@@ -522,30 +527,30 @@ class MlirGenerator {
   std::vector<ParameterInitializer> parameter_initializers_;
 };
 
-// Builds an IRPA parameter archive for large initializers.
+// Builds an IRPA parameter archive for initializer data.
 //
-// Large inline initializers are copied into an IRPA (IREE Parameter Archive)
-// file on disk. We write to an IRPA file rather than keeping data in memory
-// because ORT does not guarantee that initializer tensor data remains valid
-// beyond the Compile() call. By persisting to disk via IRPA, the data is
-// accessed at runtime through IREE's parameter index with file-backed entries.
-//
-// External initializers (already backed by external files) are added to the
-// parameter index directly, pointing to their original files without copying.
+// Inline initializers are always copied into the IRPA archive. External
+// initializers are handled based on the archive_external_data flag:
+// - true: External data is copied into the IRPA, making it self-contained.
+//   Required for EPContext caching where original model files may not be
+//   available at reload time.
+// - false: External initializers reference their original files directly,
+//   avoiding unnecessary I/O and temp disk usage for the normal compile path.
 //
 // The resulting parameter provider is registered with the IREE session so that
 // the compiled module can resolve #flow.parameter.named references at runtime.
 OrtStatus* MlirGenerator::BuildParameterArchive(
-    ParameterIndexPtr& out_index, ParameterProviderPtr& out_provider) {
+    ParameterIndexPtr& out_index, ParameterProviderPtr& out_provider,
+    bool archive_external_data) {
   if (parameter_initializers_.empty()) {
     return nullptr;
   }
 
   iree_allocator_t allocator = iree_allocator_system();
 
-  // Build source index from ORT tensor data wrapped as file handles.
-  // The tensor data is valid for the duration of this call (we are inside
-  // CompileImpl). iree_io_build_parameter_archive copies it to the IRPA file.
+  // Build source index from inline initializers (and optionally external ones).
+  // iree_io_build_parameter_archive copies data from source_index into the
+  // IRPA file on disk.
   ParameterIndexPtr source_index;
   IREE_ORT_RETURN_IF_ERROR(
       iree_io_parameter_index_create(allocator, source_index.ForOutput()));
@@ -553,45 +558,77 @@ OrtStatus* MlirGenerator::BuildParameterArchive(
   for (const auto& param : parameter_initializers_) {
     const auto& init = initializers_[param.initializer_index];
 
-    // Skip external initializers — added to target index later.
-    // Note: GetExternalInitializerInfo returns OK with null output for
-    // non-external initializers, so we must check both status and pointer.
+    // Check if this is an external initializer.
+    // GetExternalInitializerInfo returns OK with null output for non-external
+    // initializers, so we must check both status and pointer.
     Ort::ExternalInitializerInfo ext_info(nullptr);
     ORT_RETURN_IF_ERROR(init.GetExternalInitializerInfo(ext_info).release());
+
     if (ext_info) {
-      continue;
+      if (!archive_external_data) {
+        // Non-EPContext path: skip external initializers here; they will be
+        // added to target_index as direct file references after the archive
+        // build. This avoids copying potentially large external data into
+        // a temp file when EPContext caching is not in use.
+        continue;
+      }
+      // EPContext path: open the backing file and add to source index so the
+      // archive builder copies the data into the IRPA, making it
+      // self-contained for caching.
+      FileHandlePtr ext_handle;
+      std::filesystem::path model_dir =
+          std::filesystem::path(graph_.GetModelPath()).parent_path();
+      std::string filepath = (model_dir / ext_info.GetFilePath()).string();
+      IREE_ORT_RETURN_IF_ERROR(iree_io_file_handle_open(
+          IREE_IO_FILE_MODE_READ,
+          iree_make_string_view(filepath.data(), filepath.size()), allocator,
+          ext_handle.ForOutput()));
+
+      iree_io_parameter_index_entry_t entry = {};
+      entry.key = iree_make_string_view(param.sanitized_name.data(),
+                                        param.sanitized_name.size());
+      entry.length = ext_info.GetByteSize();
+      entry.type = IREE_IO_PARAMETER_INDEX_ENTRY_STORAGE_TYPE_FILE;
+      entry.storage.file.handle = ext_handle.Get();
+      entry.storage.file.offset =
+          static_cast<uint64_t>(ext_info.GetFileOffset());
+      IREE_ORT_RETURN_IF_ERROR(
+          iree_io_parameter_index_add(source_index.Get(), &entry));
+    } else {
+      // Inline initializer: wrap ORT tensor data as a memory-backed file
+      // handle. The tensor data is valid for the duration of this call (we are
+      // inside CompileImpl).
+      Ort::ConstValue tensor(nullptr);
+      auto status = init.GetInitializer(tensor);
+      if (!status.IsOK()) {
+        return Ort::Status(
+                   std::format("Failed to get initializer: {}", init.GetName())
+                       .c_str(),
+                   ORT_FAIL)
+            .release();
+      }
+
+      auto* data = const_cast<uint8_t*>(
+          static_cast<const uint8_t*>(tensor.GetTensorRawData()));
+      size_t size = tensor.GetTensorSizeInBytes();
+
+      FileHandlePtr handle;
+      iree_byte_span_t span = {data, static_cast<iree_host_size_t>(size)};
+      IREE_ORT_RETURN_IF_ERROR(iree_io_file_handle_wrap_host_allocation(
+          IREE_IO_FILE_ACCESS_READ, span,
+          iree_io_file_handle_release_callback_null(), allocator,
+          handle.ForOutput()));
+
+      iree_io_parameter_index_entry_t entry = {};
+      entry.key = iree_make_string_view(param.sanitized_name.data(),
+                                        param.sanitized_name.size());
+      entry.length = size;
+      entry.type = IREE_IO_PARAMETER_INDEX_ENTRY_STORAGE_TYPE_FILE;
+      entry.storage.file.handle = handle.Get();
+      entry.storage.file.offset = 0;
+      IREE_ORT_RETURN_IF_ERROR(
+          iree_io_parameter_index_add(source_index.Get(), &entry));
     }
-
-    Ort::ConstValue tensor(nullptr);
-    auto status = init.GetInitializer(tensor);
-    if (!status.IsOK()) {
-      return Ort::Status(
-                 std::format("Failed to get initializer: {}", init.GetName())
-                     .c_str(),
-                 ORT_FAIL)
-          .release();
-    }
-
-    auto* data = const_cast<uint8_t*>(
-        static_cast<const uint8_t*>(tensor.GetTensorRawData()));
-    size_t size = tensor.GetTensorSizeInBytes();
-
-    FileHandlePtr handle;
-    iree_byte_span_t span = {data, static_cast<iree_host_size_t>(size)};
-    IREE_ORT_RETURN_IF_ERROR(iree_io_file_handle_wrap_host_allocation(
-        IREE_IO_FILE_ACCESS_READ, span,
-        iree_io_file_handle_release_callback_null(), allocator,
-        handle.ForOutput()));
-
-    iree_io_parameter_index_entry_t entry = {};
-    entry.key = iree_make_string_view(param.sanitized_name.data(),
-                                      param.sanitized_name.size());
-    entry.length = size;
-    entry.type = IREE_IO_PARAMETER_INDEX_ENTRY_STORAGE_TYPE_FILE;
-    entry.storage.file.handle = handle.Get();
-    entry.storage.file.offset = 0;
-    IREE_ORT_RETURN_IF_ERROR(
-        iree_io_parameter_index_add(source_index.Get(), &entry));
   }
 
   // Build IRPA archive from source index.
@@ -608,35 +645,39 @@ OrtStatus* MlirGenerator::BuildParameterArchive(
         source_index.Get(), target_index.Get(), file_open, 0, allocator));
   }
 
-  // Add external initializer entries directly to target index.
-  for (const auto& param : parameter_initializers_) {
-    const auto& init = initializers_[param.initializer_index];
+  // When not archiving external data, add external initializer entries
+  // directly to target_index as file references. This is the normal
+  // (non-EPContext) path where we reference original files directly.
+  if (!archive_external_data) {
+    for (const auto& param : parameter_initializers_) {
+      const auto& init = initializers_[param.initializer_index];
 
-    Ort::ExternalInitializerInfo ext_info(nullptr);
-    ORT_RETURN_IF_ERROR(init.GetExternalInitializerInfo(ext_info).release());
-    if (!ext_info) {
-      continue;
+      Ort::ExternalInitializerInfo ext_info(nullptr);
+      ORT_RETURN_IF_ERROR(init.GetExternalInitializerInfo(ext_info).release());
+      if (!ext_info) {
+        continue;
+      }
+
+      FileHandlePtr ext_handle;
+      std::filesystem::path model_dir =
+          std::filesystem::path(graph_.GetModelPath()).parent_path();
+      std::string filepath = (model_dir / ext_info.GetFilePath()).string();
+      IREE_ORT_RETURN_IF_ERROR(iree_io_file_handle_open(
+          IREE_IO_FILE_MODE_READ,
+          iree_make_string_view(filepath.data(), filepath.size()), allocator,
+          ext_handle.ForOutput()));
+
+      iree_io_parameter_index_entry_t entry = {};
+      entry.key = iree_make_string_view(param.sanitized_name.data(),
+                                        param.sanitized_name.size());
+      entry.length = ext_info.GetByteSize();
+      entry.type = IREE_IO_PARAMETER_INDEX_ENTRY_STORAGE_TYPE_FILE;
+      entry.storage.file.handle = ext_handle.Get();
+      entry.storage.file.offset =
+          static_cast<uint64_t>(ext_info.GetFileOffset());
+      IREE_ORT_RETURN_IF_ERROR(
+          iree_io_parameter_index_add(target_index.Get(), &entry));
     }
-
-    FileHandlePtr ext_handle;
-    // External data paths are relative to the model directory.
-    std::filesystem::path model_dir =
-        std::filesystem::path(graph_.GetModelPath()).parent_path();
-    std::string filepath = (model_dir / ext_info.GetFilePath()).string();
-    IREE_ORT_RETURN_IF_ERROR(iree_io_file_handle_open(
-        IREE_IO_FILE_MODE_READ,
-        iree_make_string_view(filepath.data(), filepath.size()), allocator,
-        ext_handle.ForOutput()));
-
-    iree_io_parameter_index_entry_t entry = {};
-    entry.key = iree_make_string_view(param.sanitized_name.data(),
-                                      param.sanitized_name.size());
-    entry.length = ext_info.GetByteSize();
-    entry.type = IREE_IO_PARAMETER_INDEX_ENTRY_STORAGE_TYPE_FILE;
-    entry.storage.file.handle = ext_handle.Get();
-    entry.storage.file.offset = static_cast<uint64_t>(ext_info.GetFileOffset());
-    IREE_ORT_RETURN_IF_ERROR(
-        iree_io_parameter_index_add(target_index.Get(), &entry));
   }
 
   ParameterProviderPtr provider;
@@ -656,7 +697,8 @@ OrtStatus* GenerateMlir(const Ort::ConstGraph& graph, const OrtApi& /*ort_api*/,
                         const std::string& mlir_path,
                         const std::string& irpa_path,
                         ParameterIndexPtr& out_index,
-                        ParameterProviderPtr& out_provider) {
+                        ParameterProviderPtr& out_provider,
+                        bool archive_external_data) {
   std::ofstream file(mlir_path);
   if (!file.is_open()) {
     return Ort::Status(
@@ -676,7 +718,8 @@ OrtStatus* GenerateMlir(const Ort::ConstGraph& graph, const OrtApi& /*ort_api*/,
         .release();
   }
 
-  return gen.BuildParameterArchive(out_index, out_provider);
+  return gen.BuildParameterArchive(out_index, out_provider,
+                                   archive_external_data);
 }
 
 }  // namespace onnxruntime::iree

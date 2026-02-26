@@ -27,13 +27,19 @@ namespace onnxruntime::iree {
 // Forward declarations
 class IreeEpFactory;
 
+// EPContext node constants.
+// Domain is "com.microsoft" per the ORT EPContext specification:
+// https://onnxruntime.ai/docs/execution-providers/EP-Context-Design.html
+inline constexpr const char* kEpContextOpType = "EPContext";
+inline constexpr const char* kEpContextDomain = "com.microsoft";
+inline constexpr const char* kEpContextSource = "IREEExecutionProvider";
+
 // IREE Execution Provider.
 // Handles graph partitioning, compilation, and execution using IREE runtime.
 // Each EP instance owns an IREE HAL device created from the factory's instance.
 class IreeEp : public OrtEp, public ApiPtrs {
  public:
   struct Config {
-    bool enable_ep_context_cache = false;
     // Target architecture to compile for.
     // TODO: Ideally, we want to get this from the device. I'm not sure how
     // to do this in IREE.
@@ -44,6 +50,12 @@ class IreeEp : public OrtEp, public ApiPtrs {
     std::string backend = "";
     // Save intermediate compilation artifacts (MLIR, VMFB) for debugging.
     bool save_intermediates = false;
+    // ORT EPContext support: generate context model with cached artifacts.
+    // Set from session option "ep.context_enable".
+    bool ep_context_enable = false;
+    // Output path for the EPContext model. If empty, ORT derives it from the
+    // original model path. Set from session option "ep.context_file_path".
+    std::string ep_context_file_path = "";
   };
 
   IreeEp(IreeEpFactory& factory, const std::string& name, const Config& config,
@@ -56,6 +68,9 @@ class IreeEp : public OrtEp, public ApiPtrs {
 
   // Accessor for the logger.
   [[nodiscard]] const Ort::Logger& Logger() const { return logger_; }
+
+  // Accessor for the config.
+  [[nodiscard]] const Config& GetConfig() const { return config_; }
 
   // Accessor for the IREE runtime instance (needed by IreeNodeComputeInfo for
   // lazy session creation).
