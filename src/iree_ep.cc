@@ -60,6 +60,19 @@ static std::vector<std::string> GenerateCompileFlags(
   }
 
   flags.push_back("--iree-opt-level=" + config.opt_level);
+  // Enable quantized matmul fusion at O2+. This fuses dequantization patterns
+  // (extui→uitofp→subf→mulf) with matmul ops, critical for INT4 QDQ models.
+  if (config.opt_level == "O2" || config.opt_level == "O3") {
+    flags.push_back(
+        "--iree-global-opt-enable-quantized-matmul-reassociation");
+  }
+  // Increase stack allocation limit for models with large dispatches.
+  // O2+ fuses dequant+matmul kernels that need ~1MB stack per dispatch.
+  if (config.opt_level == "O2" || config.opt_level == "O3") {
+    flags.push_back("--iree-llvmcpu-stack-allocation-limit=2097152");
+  } else {
+    flags.push_back("--iree-llvmcpu-stack-allocation-limit=65536");
+  }
   return flags;
 }
 

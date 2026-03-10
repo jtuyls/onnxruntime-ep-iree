@@ -226,6 +226,7 @@ class MlirGenerator {
 
   OrtStatus* Generate() {
     CollectMetadata();
+    BuildShapeRefinementMaps();
     OrtStatus* status = EmitModuleHeader();
     if (status) return status;
     status = EmitFunctionBody();
@@ -297,13 +298,14 @@ class MlirGenerator {
       args << "%" << name << ": " << type;
     }
 
-    // Build return types.
+    // Build return types (use refined types if available).
     std::ostringstream ret_types;
     for (size_t i = 0; i < graph_outputs_.size(); ++i) {
       if (i > 0) {
         ret_types << ", ";
       }
-      ret_types << FormatTensorType(graph_outputs_[i].TypeInfo());
+      std::string out_name = graph_outputs_[i].GetName();
+      ret_types << GetVtensorType(out_name, graph_outputs_[i].TypeInfo());
     }
 
     // Define the #executable_target alias for hal.dispatch.extern objects()
@@ -418,30 +420,752 @@ class MlirGenerator {
     auto outputs = node.GetOutputs();
     auto attrs = node.GetAttributes();
 
+    // Track Shape ops for later Gather(Shape(tensor), idx) → size.int rewrite.
+    if (op_type == "Shape" && inputs.size() >= 1 && inputs[0] &&
+        outputs.size() >= 1 && outputs[0]) {
+      std::string shape_out = outputs[0].GetName();
+      std::string shape_src = inputs[0].GetName();
+      if (!shape_out.empty() && !shape_src.empty()) {
+        shape_source_map_[shape_out] = {
+            shape_src, GetVtensorType(shape_src, inputs[0].TypeInfo())};
+      }
+    }
+
+    // Rewrite Gather(Shape(tensor), const_idx) → torch.aten.size.int +
+    // torch.prim.NumToTensor.Scalar. This gives IREE a direct reference to the
+    // input tensor's dimension, enabling workgroup count resolution.
+    if (op_type == "Gather" && inputs.size() >= 2 && inputs[0] && inputs[1] &&
+        outputs.size() >= 1 && outputs[0]) {
+      std::string shape_name = inputs[0].GetName();
+      std::string idx_name = inputs[1].GetName();
+      auto shape_it = shape_source_map_.find(shape_name);
+      auto idx_it = known_int64_vectors_.find(idx_name);
+      if (shape_it != shape_source_map_.end() && idx_it != known_int64_vectors_.end() &&
+          idx_it->second.size() == 1) {
+        // This is Gather(Shape(tensor), const_idx) — emit size.int instead.
+        const auto& [src_name, src_type] = shape_it->second;
+        int64_t dim_idx = idx_it->second[0];
+        std::string out_name = SanitizeName(outputs[0].GetName());
+        std::string int_name = out_name + "_int";
+        out_ << std::format(
+            R"(    %{0} = torch.constant.int {1}
+    %{2} = torch.aten.size.int %{3}, %{0} : {4}, !torch.int -> !torch.int
+    %{5} = torch.prim.NumToTensor.Scalar %{2} : !torch.int -> !torch.vtensor<[],si64>
+)",
+            out_name + "_dim_idx",  // {0} constant dim index
+            dim_idx,                // {1} dim value
+            int_name,               // {2} int result name
+            SanitizeName(src_name), // {3} source tensor SSA
+            src_type,               // {4} source tensor type
+            out_name);              // {5} output scalar tensor
+        // Track the size.int SSA name for later use by ConstantOfShape.
+        size_int_ssa_map_[outputs[0].GetName()] = int_name;
+        return nullptr;
+      }
+    }
+
+    // Propagate size_int_ssa_map_ through Unsqueeze (tensor wrapping).
+    if (op_type == "Unsqueeze" && inputs.size() >= 1 && inputs[0] &&
+        outputs.size() >= 1 && outputs[0]) {
+      auto sit = size_int_ssa_map_.find(inputs[0].GetName());
+      if (sit != size_int_ssa_map_.end()) {
+        size_int_ssa_map_[outputs[0].GetName()] = sit->second;
+      }
+    }
+
+    // Rewrite ConstantOfShape to torch.aten.full when shape elements can be
+    // resolved to size.int values or constants. This gives IREE direct
+    // traceable references to input tensor dimensions.
+    if (op_type == "ConstantOfShape" && inputs.size() >= 1 && inputs[0] &&
+        outputs.size() >= 1 && outputs[0]) {
+      std::string shape_name = inputs[0].GetName();
+      auto prod_it = producer_info_.find(shape_name);
+      if (prod_it != producer_info_.end() && prod_it->second.op_type == "Concat") {
+        const auto& concat_inputs = prod_it->second.input_names;
+        std::vector<std::string> dim_ssa_names;
+        bool can_rewrite = true;
+        int counter = 0;
+        for (const auto& inp_name : concat_inputs) {
+          // Check if this concat input traces to a size.int.
+          auto sit = size_int_ssa_map_.find(inp_name);
+          if (sit != size_int_ssa_map_.end()) {
+            dim_ssa_names.push_back(sit->second);
+          } else {
+            // Check if it's a known constant.
+            auto cit = known_int64_vectors_.find(inp_name);
+            if (cit != known_int64_vectors_.end() && cit->second.size() == 1) {
+              std::string cname = SanitizeName(outputs[0].GetName()) +
+                                  "_dim_c" + std::to_string(counter++);
+              out_ << std::format("    %{} = torch.constant.int {}\n",
+                                  cname, cit->second[0]);
+              dim_ssa_names.push_back(cname);
+            } else {
+              can_rewrite = false;
+              break;
+            }
+          }
+        }
+        if (can_rewrite && !dim_ssa_names.empty()) {
+          std::string out_name = SanitizeName(outputs[0].GetName());
+          // Use refined type if available, otherwise ORT type.
+          auto ref_it = refined_types_.find(outputs[0].GetName());
+          std::string out_type = (ref_it != refined_types_.end())
+              ? ref_it->second
+              : FormatTensorType(outputs[0].TypeInfo());
+
+          // Build list construct.
+          std::ostringstream dim_refs, dim_types;
+          for (size_t i = 0; i < dim_ssa_names.size(); ++i) {
+            if (i > 0) { dim_refs << ", "; dim_types << ", "; }
+            dim_refs << "%" << dim_ssa_names[i];
+            dim_types << "!torch.int";
+          }
+          std::string list_name = out_name + "_shape_list";
+          out_ << std::format(
+              "    %{0} = torch.prim.ListConstruct {1} : ({2}) -> !torch.list<int>\n",
+              list_name, dim_refs.str(), dim_types.str());
+
+          // Extract fill value from the value attribute (default 0).
+          // The attr is dense<"0x0000"> : tensor<1xf16> or similar.
+          std::string fill_name = out_name + "_fill";
+          out_ << std::format("    %{} = torch.constant.float 0.000000e+00\n",
+                              fill_name);
+          std::string none_name = out_name + "_none";
+          out_ << std::format("    %{} = torch.constant.none\n", none_name);
+
+          // Emit torch.aten.full.
+          out_ << std::format(
+              "    %{0} = torch.aten.full %{1}, %{2}, %{3}, %{3}, %{3}, %{3} : "
+              "!torch.list<int>, !torch.float, !torch.none, !torch.none, !torch.none, !torch.none -> {4}\n",
+              out_name, list_name, fill_name, none_name, out_type);
+          return nullptr;
+        }
+      }
+    }
+
+    // Handle DequantizeLinear with block_size by decomposing to arithmetic ops.
+    // torch-mlir's ONNX conversion doesn't support the block_size attribute,
+    // so we decompose into: reshape → cast → sub(zero) → mul(scale) → reshape.
+    // The resulting arith pattern (extui → uitofp → subf → mulf) matches IREE's
+    // FuseDequantizationMatmul pass for optimized quantized inference.
+    if (op_type == "DequantizeLinear") {
+      int64_t block_size = 0;
+      for (const auto& a : attrs) {
+        if (a.GetName() == "block_size") a.GetValue(block_size);
+      }
+      if (block_size > 0) {
+        return EmitBlockedDequantizeLinear(node);
+      }
+    }
+
+    // Fused Softmax→Cast→TopK → extern dispatch for MoE routing.
+    // Replaces the decomposed pattern with a single GPU kernel that directly
+    // outputs top-k values and indices, eliminating ~216 slow_memcpy dispatches
+    // from IREE's sort-based TopK decomposition.
+    if (op_type == "TopK" && !target_config_.hal_backend.empty() &&
+        inputs.size() >= 1 && inputs[0] && outputs.size() >= 2 &&
+        outputs[0] && outputs[1]) {
+      std::string topk_input_name = inputs[0].GetName();
+      auto cast_it = producer_info_.find(topk_input_name);
+      // Check: TopK input ← Cast ← Softmax
+      if (cast_it != producer_info_.end() &&
+          cast_it->second.op_type == "Cast" &&
+          !cast_it->second.input_names.empty()) {
+        std::string cast_input_name = cast_it->second.input_names[0];
+        auto softmax_it = producer_info_.find(cast_input_name);
+        if (softmax_it != producer_info_.end() &&
+            softmax_it->second.op_type == "Softmax" &&
+            !softmax_it->second.input_names.empty()) {
+          // Found pattern: Softmax(x) → Cast(f16→f32) → TopK
+          // x is the gate logits in f16 from the router MatMul.
+          std::string gate_logits_name = softmax_it->second.input_names[0];
+
+          // Get the gate logits type info from refined types.
+          std::string gate_type;
+          auto ref_it = refined_types_.find(gate_logits_name);
+          if (ref_it != refined_types_.end()) {
+            gate_type = ref_it->second;
+          }
+
+          // Parse gate logits shape: expect [?, num_experts]
+          std::vector<int64_t> gate_dims;
+          std::string gate_elem;
+          if (!gate_type.empty() &&
+              ParseVtensorType(gate_type, gate_dims, gate_elem) &&
+              gate_dims.size() == 2 && gate_dims[1] > 0 &&
+              gate_elem == "f16") {
+            int64_t num_experts = gate_dims[1];
+
+            // Parse TopK k value from input[1] (constant tensor).
+            std::string k_name = inputs[1].GetName();
+            auto k_it = known_int64_vectors_.find(k_name);
+            if (k_it != known_int64_vectors_.end() &&
+                k_it->second.size() == 1 && k_it->second[0] > 0) {
+              int64_t top_k = k_it->second[0];
+
+              // Build kernel object filename from target arch.
+              std::string kernel_obj = "moe_topk_" +
+                  target_config_.target_arch + ".co";
+
+              // Output SSA names.
+              std::string val_name = SanitizeName(outputs[0].GetName());
+              std::string idx_name = SanitizeName(outputs[1].GetName());
+              std::string prefix = std::format("__topk_{}", extern_id_++);
+
+              // Bridge gate logits input to builtin tensor.
+              std::string gate_ssa = SanitizeName(gate_logits_name);
+              std::string dim0_str = gate_dims[0] > 0
+                  ? std::to_string(gate_dims[0]) : "?";
+              std::string gate_tensor_type = std::format(
+                  "tensor<{}x{}xf16>", dim0_str, num_experts);
+              out_ << std::format(
+                  "    %{0}_in = torch_c.to_builtin_tensor %{1} : {2} -> {3}\n",
+                  prefix, gate_ssa, gate_type, gate_tensor_type);
+
+              // Get dynamic dim (N = number of tokens) via tensor.dim
+              // on the bridged builtin tensor — gives index directly.
+              out_ << std::format(
+                  "    %{0}_c0 = arith.constant 0 : index\n"
+                  "    %{0}_dim_n = tensor.dim %{0}_in, %{0}_c0 : {1}\n",
+                  prefix, gate_tensor_type);
+
+              // Push constants: N (i32), num_experts (i32), top_k (i32).
+              out_ << std::format(
+                  "    %{0}_pc_n = arith.index_cast %{0}_dim_n : index to i32\n"
+                  "    %{0}_pc_e = arith.constant {1} : i32\n"
+                  "    %{0}_pc_k = arith.constant {2} : i32\n",
+                  prefix, num_experts, top_k);
+
+              // Workload: ceil(N / 64) for 64 threads per workgroup.
+              out_ << std::format(
+                  "    %{0}_c64 = arith.constant 64 : index\n"
+                  "    %{0}_c63 = arith.constant 63 : index\n"
+                  "    %{0}_n_plus = arith.addi %{0}_dim_n, %{0}_c63 : index\n"
+                  "    %{0}_wl = arith.divui %{0}_n_plus, %{0}_c64 : index\n",
+                  prefix);
+
+              // Output types — use static dim if known.
+              std::string val_tensor = std::format(
+                  "tensor<{}x{}xf32>", dim0_str, top_k);
+              std::string idx_tensor = std::format(
+                  "tensor<{}x{}xi64>", dim0_str, top_k);
+              std::string val_vtensor = std::format(
+                  "!torch.vtensor<[{},{}],f32>", dim0_str, top_k);
+              std::string idx_vtensor = std::format(
+                  "!torch.vtensor<[{},{}],si64>", dim0_str, top_k);
+
+              // Dynamic dim annotations: only needed when dim0 is dynamic.
+              bool dim0_dynamic = (gate_dims[0] <= 0);
+              std::string dim_annot = dim0_dynamic
+                  ? std::format("{{%{}_dim_n}}", prefix) : "";
+
+              // Emit hal.dispatch.extern.
+              out_ << std::format(
+                  R"(    %{0}_out_v, %{0}_out_i = hal.dispatch.extern "moe_topk"[%{0}_wl](%{0}_pc_n, %{0}_pc_e, %{0}_pc_k, %{0}_in)
+        : (i32, i32, i32, {1}{5}) -> ({2}{5}, {3}{5})
+      count(%device: !hal.device, %workload: index) -> (index, index, index) {{
+        %c1 = arith.constant 1 : index
+        hal.return %workload, %c1, %c1 : index, index, index
+      }}
+      layout(#hal.pipeline.layout<constants = 3, bindings = [
+        #hal.pipeline.binding<storage_buffer, ReadOnly>,
+        #hal.pipeline.binding<storage_buffer>,
+        #hal.pipeline.binding<storage_buffer>
+      ]>)
+      objects({{
+        #executable_target ordinal(0) = [
+          #hal.executable.object<{{path = "{4}"}}>
+        ]
+      }})
+      attributes {{workgroup_size = [64 : index, 1 : index, 1 : index]}}
+)",
+                  prefix,             // {0}
+                  gate_tensor_type,   // {1} input type
+                  val_tensor,         // {2} values output type
+                  idx_tensor,         // {3} indices output type
+                  kernel_obj,         // {4} kernel object path
+                  dim_annot);         // {5} dynamic dim annotation
+
+              // Bridge outputs back to torch types.
+              out_ << std::format(
+                  "    %{0} = torch_c.from_builtin_tensor %{1}_out_v : {2} -> {3}\n"
+                  "    %{4} = torch_c.from_builtin_tensor %{1}_out_i : {5} -> {6}\n",
+                  val_name, prefix, val_tensor, val_vtensor,
+                  idx_name, idx_tensor, idx_vtensor);
+
+              // Store refined types for downstream propagation.
+              refined_types_[outputs[0].GetName()] = val_vtensor;
+              refined_types_[outputs[1].GetName()] = idx_vtensor;
+              return nullptr;
+            }
+          }
+        }
+      }
+    }
+
+    // ScatterElements → tensor.insert_slice for KV cache updates.
+    // Detects the pattern:
+    //   ScatterElements(data=past_kv, indices=Expand(Reshape(Cast(Add(
+    //     Range(0,seq_len,1), offset)))), updates=new_kv, axis=2)
+    // which is a contiguous slice write: past_kv[:,:,pos:pos+seq_len,:] = new_kv.
+    // Emitting tensor.insert_slice instead eliminates the 4D index tensor
+    // decomposition that IREE lowers to ~240 slow_memcpy dispatches.
+    if (op_type == "ScatterElements" && inputs.size() >= 3 &&
+        inputs[0] && inputs[1] && inputs[2] &&
+        outputs.size() >= 1 && outputs[0]) {
+      // Check axis attribute.
+      int64_t axis = 0;
+      for (const auto& attr : attrs) {
+        if (attr.GetName() == "axis") {
+          attr.GetValue(axis);
+          break;
+        }
+      }
+
+      // Only handle axis=2 KV cache scatter pattern for now.
+      if (axis == 2) {
+        // Trace index chain backwards from indices to find:
+        //   Expand ← (Reshape|Cast)* ← Add(Range, offset)
+        std::string idx_name = inputs[1].GetName();
+        auto expand_it = producer_info_.find(idx_name);
+        if (expand_it != producer_info_.end() &&
+            expand_it->second.op_type == "Expand" &&
+            !expand_it->second.input_names.empty()) {
+          // Walk backwards through Reshape/Cast to find the Add.
+          std::string cur = expand_it->second.input_names[0];
+          const ProducerInfo* add_info = nullptr;
+          for (int depth = 0; depth < 5; ++depth) {
+            auto it = producer_info_.find(cur);
+            if (it == producer_info_.end() || it->second.input_names.empty())
+              break;
+            if (it->second.op_type == "Add") {
+              add_info = &it->second;
+              break;
+            }
+            if (it->second.op_type == "Reshape" ||
+                it->second.op_type == "Cast") {
+              cur = it->second.input_names[0];
+              continue;
+            }
+            break;  // Unexpected op — stop.
+          }
+
+          if (add_info && add_info->input_names.size() >= 2) {
+            // Found: Add(Range, offset). Determine which input is Range
+            // and which is the scalar offset (seq_position).
+            std::string offset_name;
+            for (const auto& add_inp : add_info->input_names) {
+              auto range_it = producer_info_.find(add_inp);
+              if (range_it != producer_info_.end() &&
+                  range_it->second.op_type == "Range") {
+                continue;  // Skip the Range input.
+              }
+              offset_name = add_inp;  // The other input is the offset.
+            }
+
+            if (!offset_name.empty()) {
+                  // Pattern matched! Emit tensor.insert_slice.
+                  std::string data_name = inputs[0].GetName();
+                  std::string update_name = inputs[2].GetName();
+                  std::string out_name = outputs[0].GetName();
+
+                  std::string data_ssa = SanitizeName(data_name);
+                  std::string update_ssa = SanitizeName(update_name);
+                  std::string offset_ssa = SanitizeName(offset_name);
+                  std::string out_ssa = SanitizeName(out_name);
+
+                  // Get types.
+                  std::string data_vtype =
+                      GetVtensorType(data_name, inputs[0].TypeInfo());
+                  std::string update_vtype =
+                      GetVtensorType(update_name, inputs[2].TypeInfo());
+                  auto update_info =
+                      inputs[2].TypeInfo().GetTensorTypeAndShapeInfo();
+                  auto data_info =
+                      inputs[0].TypeInfo().GetTensorTypeAndShapeInfo();
+                  auto update_shape = update_info.GetShape();
+                  auto data_shape = data_info.GetShape();
+
+                  // Get refined update type if available.
+                  auto ref_it = refined_types_.find(update_name);
+                  if (ref_it != refined_types_.end()) {
+                    update_vtype = ref_it->second;
+                  }
+                  auto ref_data = refined_types_.find(data_name);
+                  if (ref_data != refined_types_.end()) {
+                    data_vtype = ref_data->second;
+                  }
+
+                  // Parse shapes.
+                  std::vector<int64_t> data_dims, update_dims;
+                  std::string data_elem, update_elem;
+                  ParseVtensorType(data_vtype, data_dims, data_elem);
+                  ParseVtensorType(update_vtype, update_dims, update_elem);
+
+                  if (data_dims.size() == 4 && update_dims.size() == 4) {
+                    // Build builtin tensor types from refined dims
+                    // (ORT type info may have all-dynamic shapes).
+                    std::string elem_type = GetElementType(
+                        data_info.GetElementType(), /*signless=*/true);
+                    auto fmt_ttype = [&](const std::vector<int64_t>& dims) {
+                      std::ostringstream ss;
+                      ss << "tensor<";
+                      for (size_t i = 0; i < dims.size(); ++i) {
+                        if (dims[i] < 0) ss << "?"; else ss << dims[i];
+                        ss << "x";
+                      }
+                      ss << elem_type << ">";
+                      return ss.str();
+                    };
+                    std::string data_ttype = fmt_ttype(data_dims);
+                    std::string update_ttype = fmt_ttype(update_dims);
+
+                    std::string prefix = std::format("__kv_update_{}", extern_id_++);
+
+                    // Bridge data (past_kv) and updates (new_kv) to builtin.
+                    out_ << std::format(
+                        "    %{0}_data = torch_c.to_builtin_tensor %{1}"
+                        " : {2} -> {3}\n",
+                        prefix, data_ssa, data_vtype, data_ttype);
+                    out_ << std::format(
+                        "    %{0}_src = torch_c.to_builtin_tensor %{1}"
+                        " : {2} -> {3}\n",
+                        prefix, update_ssa, update_vtype, update_ttype);
+
+                    // Extract offset as index.
+                    // seq_position is a scalar i64 vtensor — extract and
+                    // convert to index.
+                    out_ << std::format(
+                        "    %{0}_off_t = torch_c.to_builtin_tensor"
+                        " %{1} : !torch.vtensor<[],si64> -> tensor<i64>\n"
+                        "    %{0}_off_i64 = tensor.extract %{0}_off_t[]"
+                        " : tensor<i64>\n"
+                        "    %{0}_off = arith.index_cast %{0}_off_i64"
+                        " : i64 to index\n",
+                        prefix, offset_ssa);
+
+                    // Get dynamic dim for seq_len (axis 2 of updates).
+                    // Use tensor.dim on the builtin update tensor.
+                    out_ << std::format(
+                        "    %{0}_c2 = arith.constant 2 : index\n"
+                        "    %{0}_seq_len = tensor.dim %{0}_src, %{0}_c2"
+                        " : {1}\n",
+                        prefix, update_ttype);
+
+                    // Build static sizes for non-axis dims.
+                    // data shape: [1, 16, 256, 128] (all static)
+                    // update shape: [1, 16, ?, 128]
+                    // insert_slice offsets: [0, 0, %off, 0]
+                    // insert_slice sizes: [1, 16, %seq_len, 128]
+                    // insert_slice strides: [1, 1, 1, 1]
+                    std::string offsets = std::format(
+                        "0, 0, %{}_off, 0", prefix);
+                    // If seq_len dim (axis 2) is static, use the constant;
+                    // otherwise use the dynamic SSA value.
+                    std::string seq_len_str =
+                        update_dims[2] > 0
+                            ? std::to_string(update_dims[2])
+                            : std::format("%{}_seq_len", prefix);
+                    std::string sizes = std::format(
+                        "{}, {}, {}, {}",
+                        update_dims[0] > 0 ? std::to_string(update_dims[0]) : "1",
+                        update_dims[1] > 0 ? std::to_string(update_dims[1]) : "16",
+                        seq_len_str,
+                        update_dims[3] > 0 ? std::to_string(update_dims[3]) : "128");
+
+                    // Emit tensor.insert_slice.
+                    out_ << std::format(
+                        "    %{0}_result = tensor.insert_slice %{0}_src"
+                        " into %{0}_data[{1}] [{2}] [1, 1, 1, 1]"
+                        " : {3} into {4}\n",
+                        prefix, offsets, sizes, update_ttype, data_ttype);
+
+                    // Bridge result back to vtensor.
+                    std::string out_vtype = data_vtype;
+                    out_ << std::format(
+                        "    %{0} = torch_c.from_builtin_tensor %{1}_result"
+                        " : {2} -> {3}\n",
+                        out_ssa, prefix, data_ttype, out_vtype);
+
+                    // Store refined type.
+                    refined_types_[out_name] = out_vtype;
+                    return nullptr;
+                  }
+                }
+            }
+          }
+        }
+      }
+
+    // Handle ReduceMean/ReduceSum with tensor axes input (opset 18+).
+    // torch-mlir expects axes as an attribute (opset 17 format), so convert
+    // the tensor input back to an attribute when the axes are known constants.
+    if ((op_type == "ReduceMean" || op_type == "ReduceSum" ||
+         op_type == "ReduceMax" || op_type == "ReduceMin") &&
+        inputs.size() >= 2 && inputs[1] && !inputs[1].GetName().empty()) {
+      auto axes_it = known_int64_vectors_.find(inputs[1].GetName());
+      if (axes_it != known_int64_vectors_.end()) {
+        return EmitReduceWithAxesAttr(node, op_type, axes_it->second);
+      }
+    }
+
+    // For Transpose: emit torch.aten.permute instead of generic onnx.Transpose.
+    // torch.aten.permute is better handled by IREE's fusion passes, allowing
+    // the permutation to be folded into adjacent producer/consumer kernels
+    // rather than materializing as a separate slow_memcpy dispatch.
+    if (op_type == "Transpose" && inputs.size() >= 1 && inputs[0] &&
+        outputs.size() >= 1 && outputs[0]) {
+      // Extract perm attribute.
+      std::vector<int64_t> perm;
+      for (const auto& attr : attrs) {
+        if (attr.GetName() == "perm" &&
+            attr.GetType() == ORT_OP_ATTR_INTS) {
+          attr.GetValueArray<int64_t>(perm);
+          break;
+        }
+      }
+      if (!perm.empty()) {
+        std::string out_name = SanitizeName(outputs[0].GetName());
+        std::string data_name = SanitizeName(inputs[0].GetName());
+        std::string data_type = GetVtensorType(inputs[0].GetName(),
+                                                inputs[0].TypeInfo());
+        // Compute output type by permuting input dims.
+        std::string in_type = data_type;
+        std::vector<int64_t> in_dims;
+        std::string elem_type;
+        std::string out_type;
+        if (ParseVtensorType(in_type, in_dims, elem_type) &&
+            perm.size() == in_dims.size()) {
+          std::vector<int64_t> out_dims(perm.size());
+          for (size_t i = 0; i < perm.size(); ++i) {
+            out_dims[i] = in_dims[perm[i]];
+          }
+          out_type = BuildVtensorType(out_dims, elem_type);
+        } else {
+          out_type = FormatTensorType(outputs[0].TypeInfo());
+        }
+        // Store refined type for downstream propagation.
+        refined_types_[outputs[0].GetName()] = out_type;
+
+        // Emit perm constants and ListConstruct.
+        std::ostringstream dim_refs, dim_types;
+        for (size_t i = 0; i < perm.size(); ++i) {
+          std::string pname = out_name + "_p" + std::to_string(i);
+          out_ << std::format("    %{} = torch.constant.int {}\n",
+                              pname, perm[i]);
+          if (i > 0) { dim_refs << ", "; dim_types << ", "; }
+          dim_refs << "%" << pname;
+          dim_types << "!torch.int";
+        }
+        std::string list_name = out_name + "_perm";
+        out_ << std::format(
+            "    %{0} = torch.prim.ListConstruct {1} : ({2}) -> !torch.list<int>\n",
+            list_name, dim_refs.str(), dim_types.str());
+        out_ << std::format(
+            "    %{0} = torch.aten.permute %{1}, %{2} : {3}, !torch.list<int> -> {4}\n",
+            out_name, data_name, list_name, data_type, out_type);
+        return nullptr;
+      }
+    }
+
+    // For Reshape, try to refine the output shape by tracing constant values
+    // through the shape tensor (ORT loses this info through Concat chains).
+    std::string refined_reshape_type;
+    if (op_type == "Reshape") {
+      refined_reshape_type = RefineReshapeOutputType(node);
+    }
+
     // Build output SSA names and types.
+    // First, collect output names for later refinement storage.
+    std::vector<std::string> output_names;
+    std::vector<std::string> output_type_strs;
+    for (size_t i = 0; i < outputs.size(); ++i) {
+      if (!outputs[i]) { output_names.push_back(""); output_type_strs.push_back(""); continue; }
+      std::string name = outputs[i].GetName();
+      output_names.push_back(name);
+      if (i == 0 && !refined_reshape_type.empty()) {
+        output_type_strs.push_back(refined_reshape_type);
+      } else {
+        output_type_strs.push_back(FormatTensorType(outputs[i].TypeInfo()));
+      }
+    }
+
+    // Propagate refined shapes through downstream ops.
+    PropagateRefinedTypes(op_type, inputs, outputs, attrs, output_names,
+                          output_type_strs);
+
     std::ostringstream out_names;
     std::ostringstream out_types;
     bool first_output = true;
     size_t valid_output_count = 0;
     for (size_t i = 0; i < outputs.size(); ++i) {
-      if (!outputs[i]) {
-        // Skip invalid outputs (optional outputs can be empty/null).
-        continue;
-      }
-      std::string output_name = outputs[i].GetName();
-      if (output_name.empty()) {
-        // Skip empty outputs.
-        continue;
-      }
+      if (output_names[i].empty()) continue;
       if (!first_output) {
         out_names << ", ";
         out_types << ", ";
       }
       first_output = false;
       valid_output_count++;
-      out_names << "%" << SanitizeName(output_name);
-      out_types << FormatTensorType(outputs[i].TypeInfo());
+      out_names << "%" << SanitizeName(output_names[i]);
+      out_types << output_type_strs[i];
     }
+
+    // For Reshape: if the shape tensor comes from a Concat, emit
+    // torch.aten.reshape with a list of ints instead of onnx.Reshape with
+    // a shape tensor. For known values, use torch.constant.int. For unknown
+    // values, use the tracked size.int SSA name. This gives IREE direct
+    // traceable shape values.
+    if (op_type == "Reshape" && inputs.size() >= 2 && inputs[1]) {
+      std::string shape_name = inputs[1].GetName();
+      auto prod_it = producer_info_.find(shape_name);
+      if (prod_it != producer_info_.end() &&
+          prod_it->second.op_type == "Concat") {
+        const auto& concat_inputs = prod_it->second.input_names;
+        std::vector<std::string> dim_ssa_names;
+        bool can_rewrite = true;
+        int counter = 0;
+        for (const auto& inp_name : concat_inputs) {
+          auto cit = known_int64_vectors_.find(inp_name);
+          if (cit != known_int64_vectors_.end() && cit->second.size() == 1) {
+            // Known constant (including ONNX -1 "infer").
+            std::string cname = SanitizeName(output_names[0]) +
+                                "_rs_c" + std::to_string(counter++);
+            out_ << std::format("    %{} = torch.constant.int {}\n",
+                                cname, cit->second[0]);
+            dim_ssa_names.push_back(cname);
+          } else {
+            // Try size.int reference for unknown dims.
+            auto sit = size_int_ssa_map_.find(inp_name);
+            if (sit != size_int_ssa_map_.end()) {
+              dim_ssa_names.push_back(sit->second);
+            } else {
+              can_rewrite = false;
+              break;
+            }
+          }
+        }
+        if (can_rewrite && !dim_ssa_names.empty()) {
+          std::string out_name = SanitizeName(output_names[0]);
+          std::string data_name = SanitizeName(inputs[0].GetName());
+          std::string data_type = GetVtensorType(inputs[0].GetName(),
+                                                  inputs[0].TypeInfo());
+          // Build list construct.
+          std::ostringstream dim_refs, dim_types;
+          for (size_t i = 0; i < dim_ssa_names.size(); ++i) {
+            if (i > 0) { dim_refs << ", "; dim_types << ", "; }
+            dim_refs << "%" << dim_ssa_names[i];
+            dim_types << "!torch.int";
+          }
+          std::string list_name = out_name + "_rs_shape";
+          out_ << std::format(
+              "    %{0} = torch.prim.ListConstruct {1} : ({2}) -> !torch.list<int>\n",
+              list_name, dim_refs.str(), dim_types.str());
+          out_ << std::format(
+              "    %{0} = torch.aten.reshape %{1}, %{2} : {3}, !torch.list<int> -> {4}\n",
+              out_name, data_name, list_name, data_type,
+              output_type_strs[0]);
+          return nullptr;
+        }
+      }
+      // Fallback: if shape is a known constant vector (not from Concat),
+      // try direct constant rewrite (max 1 unknown allowed).
+      if (!shape_name.empty()) {
+        std::vector<int64_t> shape_vals;
+        int unknown_count = 0;
+        if (ResolveShapeVector(shape_name, shape_vals, &unknown_count) &&
+            !shape_vals.empty() && unknown_count == 0) {
+          // All values known (may include ONNX -1).
+          std::string out_name = SanitizeName(output_names[0]);
+          std::string data_name = SanitizeName(inputs[0].GetName());
+          std::string data_type = GetVtensorType(inputs[0].GetName(),
+                                                  inputs[0].TypeInfo());
+          std::string unique_pfx = out_name + "_rs_";
+          std::vector<std::string> dim_names;
+          std::ostringstream dim_types;
+          for (size_t i = 0; i < shape_vals.size(); ++i) {
+            std::string dname = unique_pfx + "d" + std::to_string(i);
+            out_ << std::format("    %{} = torch.constant.int {}\n",
+                                dname, shape_vals[i]);
+            dim_names.push_back(dname);
+            if (i > 0) dim_types << ", ";
+            dim_types << "!torch.int";
+          }
+          std::ostringstream dim_refs;
+          for (size_t i = 0; i < dim_names.size(); ++i) {
+            if (i > 0) dim_refs << ", ";
+            dim_refs << "%" << dim_names[i];
+          }
+          std::string list_name = unique_pfx + "shape";
+          out_ << std::format(
+              "    %{0} = torch.prim.ListConstruct {1} : ({2}) -> !torch.list<int>\n",
+              list_name, dim_refs.str(), dim_types.str());
+          out_ << std::format(
+              "    %{0} = torch.aten.reshape %{1}, %{2} : {3}, !torch.list<int> -> {4}\n",
+              out_name, data_name, list_name, data_type,
+              output_type_strs[0]);
+          return nullptr;
+        }
+      }
+    }
+
+    // For Unsqueeze: extract axes from the constant tensor input and emit
+    // torch.aten.unsqueeze. ONNX Unsqueeze takes axes as a tensor input,
+    // but torch-mlir expects an integer attribute.
+    if (op_type == "Unsqueeze" && inputs.size() >= 2 && inputs[1]) {
+      std::string axes_name = inputs[1].GetName();
+      auto cit = known_int64_vectors_.find(axes_name);
+      if (cit != known_int64_vectors_.end() && cit->second.size() == 1) {
+        int64_t axis = cit->second[0];
+        std::string out_name = SanitizeName(output_names[0]);
+        std::string data_name = SanitizeName(inputs[0].GetName());
+        std::string data_type = GetVtensorType(inputs[0].GetName(),
+                                                inputs[0].TypeInfo());
+        std::string dim_name = out_name + "_axis";
+        out_ << std::format("    %{} = torch.constant.int {}\n",
+                            dim_name, axis);
+        out_ << std::format(
+            "    %{0} = torch.aten.unsqueeze %{1}, %{2} : {3}, !torch.int -> {4}\n",
+            out_name, data_name, dim_name, data_type,
+            output_type_strs[0]);
+        return nullptr;
+      }
+      // Multi-axis unsqueeze: emit sequential unsqueezes.
+      if (cit != known_int64_vectors_.end() && cit->second.size() > 1) {
+        std::string data_name = SanitizeName(inputs[0].GetName());
+        std::string data_type = GetVtensorType(inputs[0].GetName(),
+                                                inputs[0].TypeInfo());
+        auto axes = cit->second;
+        // Sort axes ascending so insertion positions are correct.
+        std::sort(axes.begin(), axes.end());
+        std::string cur_name = data_name;
+        std::string cur_type = data_type;
+        for (size_t ai = 0; ai < axes.size(); ++ai) {
+          std::string step_name = (ai + 1 == axes.size())
+              ? SanitizeName(output_names[0])
+              : SanitizeName(output_names[0]) + "_usq" + std::to_string(ai);
+          std::string step_type = (ai + 1 == axes.size())
+              ? output_type_strs[0]
+              // Intermediate type: we don't track it precisely, use output
+              // type as approximation for last step; for intermediates, use
+              // a generic dynamic type.
+              : output_type_strs[0];
+          std::string dim_name = step_name + "_axis";
+          out_ << std::format("    %{} = torch.constant.int {}\n",
+                              dim_name, axes[ai]);
+          out_ << std::format(
+              "    %{0} = torch.aten.unsqueeze %{1}, %{2} : {3}, !torch.int -> {4}\n",
+              step_name, cur_name, dim_name, cur_type, step_type);
+          cur_name = step_name;
+          cur_type = step_type;
+        }
+        return nullptr;
+      }
+    }
+
+    // Constant shape tensor for non-Reshape ops (currently unused, kept for
+    // potential future ConstantOfShape use).
+    std::string const_shape_ssa_name;
+    size_t const_shape_input_idx = SIZE_MAX;
 
     // Build input SSA references.
     std::ostringstream in_names;
@@ -461,8 +1185,15 @@ class MlirGenerator {
         in_types << ", ";
       }
       first_input = false;
-      in_names << "%" << SanitizeName(input_name);
-      in_types << FormatTensorType(inputs[i].TypeInfo());
+      // Use the constant shape tensor if we emitted one for this input.
+      if (i == const_shape_input_idx && !const_shape_ssa_name.empty()) {
+        in_names << "%" << const_shape_ssa_name;
+        in_types << std::format("!torch.vtensor<[{}],si64>",
+            inputs[i].TypeInfo().GetTensorTypeAndShapeInfo().GetShape()[0]);
+      } else {
+        in_names << "%" << SanitizeName(input_name);
+        in_types << GetVtensorType(input_name, inputs[i].TypeInfo());
+      }
     }
 
     // Build attributes.
@@ -773,7 +1504,7 @@ class MlirGenerator {
       if (input_name.empty()) continue;
 
       std::string ssa = SanitizeName(input_name);
-      std::string vtensor_type = FormatTensorType(inputs[i].TypeInfo());
+      std::string vtensor_type = GetVtensorType(input_name, inputs[i].TypeInfo());
       std::string tensor_type = FormatMlirTensorType(inputs[i].TypeInfo());
       auto tensor_info = inputs[i].TypeInfo().GetTensorTypeAndShapeInfo();
       std::string raw = std::format("{}_raw_{}", prefix, i);
@@ -847,7 +1578,7 @@ class MlirGenerator {
       if (output_name.empty()) continue;
       out_raw_names.push_back(std::format("{}_out{}", prefix, i));
       out_raw_types.push_back(FormatMlirTensorType(outputs[i].TypeInfo()));
-      out_vtensor_types.push_back(FormatTensorType(outputs[i].TypeInfo()));
+      out_vtensor_types.push_back(GetVtensorType(output_name, outputs[i].TypeInfo()));
       out_ssa_names.push_back(SanitizeName(output_name));
     }
 
@@ -956,7 +1687,8 @@ class MlirGenerator {
         ret_types << ", ";
       }
       ret_values << "%" << SanitizeName(graph_outputs_[i].GetName());
-      ret_types << FormatTensorType(graph_outputs_[i].TypeInfo());
+      std::string out_name = graph_outputs_[i].GetName();
+      ret_types << GetVtensorType(out_name, graph_outputs_[i].TypeInfo());
     }
 
     out_ << std::format("    return {0} : {1}\n", ret_values.str(),
@@ -967,6 +1699,984 @@ class MlirGenerator {
     out_ << "  }\n";
     out_ << "}\n";
   }
+
+  // Shape refinement: try to resolve static dimensions for Reshape outputs.
+  // ORT's shape inference can't trace constant values through Concat→Reshape
+  // chains, so it marks all output dims as dynamic. We recover static dims by
+  // tracking known constant values from initializers and Constant nodes.
+
+  // Returns a refined output type string for Reshape if we can recover any
+  // static dims, or empty string if we can't improve on ORT's inference.
+  // Parse a vtensor type string like "!torch.vtensor<[?,?,16,128],f16>" into
+  // shape dims and element type. Returns false if parsing fails.
+  static bool ParseVtensorType(const std::string& type,
+                                std::vector<int64_t>& dims,
+                                std::string& elem_type) {
+    // Expected format: !torch.vtensor<[d0,d1,...],dtype>
+    auto bracket_start = type.find('[');
+    auto bracket_end = type.find(']');
+    auto last_comma = type.rfind(',');
+    auto angle_end = type.rfind('>');
+    if (bracket_start == std::string::npos || bracket_end == std::string::npos ||
+        last_comma == std::string::npos || angle_end == std::string::npos)
+      return false;
+
+    // Parse dims between [ and ]
+    dims.clear();
+    std::string dims_str = type.substr(bracket_start + 1, bracket_end - bracket_start - 1);
+    if (dims_str.empty()) return false;
+    std::istringstream iss(dims_str);
+    std::string token;
+    while (std::getline(iss, token, ',')) {
+      if (token == "?") {
+        dims.push_back(-1);
+      } else {
+        dims.push_back(std::stoll(token));
+      }
+    }
+
+    // Element type is after the last comma before >
+    elem_type = type.substr(bracket_end + 2, angle_end - bracket_end - 2);
+    return !dims.empty();
+  }
+
+  // Build a vtensor type string from dims and element type.
+  static std::string BuildVtensorType(const std::vector<int64_t>& dims,
+                                       const std::string& elem_type) {
+    std::ostringstream ss;
+    ss << "!torch.vtensor<[";
+    for (size_t i = 0; i < dims.size(); ++i) {
+      if (i > 0) ss << ",";
+      if (dims[i] < 0) ss << "?"; else ss << dims[i];
+    }
+    ss << "]," << elem_type << ">";
+    return ss.str();
+  }
+
+  // Propagate refined types through ops with predictable shape behavior.
+  // Updates output_type_strs in-place and stores results in refined_types_.
+  void PropagateRefinedTypes(
+      const std::string& op_type,
+      const std::vector<Ort::ConstValueInfo>& inputs,
+      const std::vector<Ort::ConstValueInfo>& outputs,
+      const std::vector<Ort::ConstOpAttr>& attrs,
+      const std::vector<std::string>& output_names,
+      std::vector<std::string>& output_type_strs) {
+
+    // Get the effective type of input[0] (refined or ORT original).
+    if (inputs.empty() || !inputs[0]) return;
+    std::string input0_name = inputs[0].GetName();
+    if (input0_name.empty()) return;
+    std::string input0_type = GetVtensorType(input0_name, inputs[0].TypeInfo());
+
+    std::vector<int64_t> in_dims;
+    std::string elem_type;
+    if (!ParseVtensorType(input0_type, in_dims, elem_type)) return;
+
+    // Helper to store a refined output type (declared early for ConstantOfShape).
+    auto StoreRefined = [&](size_t idx, const std::string& refined) {
+      if (idx < output_names.size() && !output_names[idx].empty()) {
+        output_type_strs[idx] = refined;
+        refined_types_[output_names[idx]] = refined;
+      }
+    };
+
+    // ConstantOfShape: output shape comes from the VALUES in input[0],
+    // not from its tensor shape. Use ResolveShapeVector to get known dims.
+    if (op_type == "ConstantOfShape") {
+      std::vector<int64_t> shape_vals;
+      if (ResolveShapeVector(input0_name, shape_vals)) {
+        auto out_info = outputs[0].TypeInfo().GetTensorTypeAndShapeInfo();
+        auto ort_shape = out_info.GetShape();
+        auto dtype = out_info.GetElementType();
+        if (ort_shape.size() == shape_vals.size()) {
+          std::vector<int64_t> merged(ort_shape.begin(), ort_shape.end());
+          bool improved = false;
+          for (size_t i = 0; i < merged.size(); ++i) {
+            if (merged[i] < 0 && shape_vals[i] >= 0) {
+              merged[i] = shape_vals[i];
+              improved = true;
+            }
+          }
+          if (improved) {
+            StoreRefined(0, BuildVtensorType(merged, GetElementType(dtype)));
+          }
+        }
+      }
+      return;
+    }
+
+    // Check if input[0] has any static dims that ORT's output might lack.
+    // Skip propagation if input[0] is fully dynamic.
+    bool has_static_dim = false;
+    for (int64_t d : in_dims) {
+      if (d >= 0) { has_static_dim = true; break; }
+    }
+    if (!has_static_dim) return;
+
+    // Helper to read an int64 attribute by name.
+    auto GetIntAttr = [&](const std::string& attr_name,
+                          int64_t default_val) -> int64_t {
+      for (const auto& attr : attrs) {
+        if (attr.GetName() == attr_name) {
+          int64_t val = default_val;
+          attr.GetValue(val);
+          return val;
+        }
+      }
+      return default_val;
+    };
+
+    auto GetIntsAttr = [&](const std::string& attr_name,
+                           std::vector<int64_t>& out) -> bool {
+      for (const auto& attr : attrs) {
+        if (attr.GetName() == attr_name) {
+          attr.GetValueArray(out);
+          return !out.empty();
+        }
+      }
+      return false;
+    };
+
+    // Helper to get ORT's output shape and element type.
+    auto GetOrtOutputInfo = [&](size_t idx)
+        -> std::pair<std::vector<int64_t>, ONNXTensorElementDataType> {
+      auto info = outputs[idx].TypeInfo().GetTensorTypeAndShapeInfo();
+      return {info.GetShape(), info.GetElementType()};
+    };
+
+    // Transpose: permute dimensions.
+    if (op_type == "Transpose") {
+      std::vector<int64_t> perm;
+      GetIntsAttr("perm", perm);
+      if (perm.size() == in_dims.size()) {
+        std::vector<int64_t> out_dims(perm.size());
+        for (size_t i = 0; i < perm.size(); ++i) {
+          out_dims[i] = in_dims[perm[i]];
+        }
+        StoreRefined(0, BuildVtensorType(out_dims, elem_type));
+      }
+    }
+    // Element-wise ops: output shape matches broadcast of inputs.
+    else if (op_type == "Add" || op_type == "Sub" || op_type == "Mul" ||
+             op_type == "Div" || op_type == "Pow" || op_type == "Relu" ||
+             op_type == "Sigmoid" || op_type == "Tanh" || op_type == "Neg" ||
+             op_type == "Sqrt" || op_type == "Erf" || op_type == "Cast" ||
+             op_type == "Silu" || op_type == "Sin" || op_type == "Cos" ||
+             op_type == "Where" ||
+             op_type == "ScatterElements" || op_type == "GatherElements") {
+      auto [ort_shape, dtype] = GetOrtOutputInfo(0);
+      // Find the highest-rank input with refined info to use for propagation.
+      // This handles broadcast cases like Mul([2048], [1,?,2048]) → [1,?,2048].
+      std::vector<int64_t> best_dims = in_dims;
+      for (size_t i = 1; i < inputs.size(); ++i) {
+        if (!inputs[i]) continue;
+        std::string inp_name = inputs[i].GetName();
+        if (inp_name.empty()) continue;
+        std::string inp_type = GetVtensorType(inp_name, inputs[i].TypeInfo());
+        std::vector<int64_t> inp_dims;
+        std::string inp_elem;
+        if (ParseVtensorType(inp_type, inp_dims, inp_elem) &&
+            inp_dims.size() > best_dims.size()) {
+          best_dims = inp_dims;
+        }
+      }
+      if (ort_shape.size() == best_dims.size()) {
+        std::vector<int64_t> merged(best_dims.size());
+        for (size_t i = 0; i < best_dims.size(); ++i) {
+          merged[i] = (ort_shape[i] >= 0) ? ort_shape[i] : best_dims[i];
+        }
+        StoreRefined(0, BuildVtensorType(merged, GetElementType(dtype)));
+      }
+    }
+    // MatMul: propagate batch dims from both inputs.
+    else if (op_type == "MatMul") {
+      auto [ort_shape, dtype] = GetOrtOutputInfo(0);
+      if (ort_shape.size() >= 2) {
+        std::vector<int64_t> merged(ort_shape.begin(), ort_shape.end());
+        // Gather batch dim info from all inputs.
+        for (size_t inp = 0; inp < inputs.size(); ++inp) {
+          if (!inputs[inp]) continue;
+          std::string inp_name = inputs[inp].GetName();
+          if (inp_name.empty()) continue;
+          std::string inp_type = GetVtensorType(inp_name, inputs[inp].TypeInfo());
+          std::vector<int64_t> inp_dims;
+          std::string inp_elem;
+          if (!ParseVtensorType(inp_type, inp_dims, inp_elem)) continue;
+          if (inp_dims.size() != ort_shape.size()) continue;
+          for (size_t i = 0; i + 2 < merged.size(); ++i) {
+            if (merged[i] < 0 && inp_dims[i] >= 0) merged[i] = inp_dims[i];
+          }
+        }
+        StoreRefined(0, BuildVtensorType(merged, GetElementType(dtype)));
+      }
+    }
+    // ReduceMean (keepdims): non-reduced dims match input.
+    else if (op_type == "ReduceMean" || op_type == "ReduceSum" ||
+             op_type == "ReduceMax" || op_type == "ReduceMin") {
+      auto [ort_shape, dtype] = GetOrtOutputInfo(0);
+      if (ort_shape.size() == in_dims.size()) {
+        // keepdims case: non-reduced dims should match input.
+        std::vector<int64_t> merged(ort_shape.begin(), ort_shape.end());
+        for (size_t i = 0; i < merged.size(); ++i) {
+          if (merged[i] < 0 && in_dims[i] >= 0) merged[i] = in_dims[i];
+        }
+        StoreRefined(0, BuildVtensorType(merged, GetElementType(dtype)));
+      }
+    }
+    // Softmax/LayerNorm: same shape as input.
+    else if (op_type == "Softmax" || op_type == "LayerNormalization") {
+      auto [_, dtype] = GetOrtOutputInfo(0);
+      StoreRefined(0, BuildVtensorType(in_dims, GetElementType(dtype)));
+    }
+    // Split: same as input except split dim is divided.
+    else if (op_type == "Split") {
+      int64_t axis = GetIntAttr("axis", 0);
+      if (axis < 0) axis += in_dims.size();
+      // Try to resolve split sizes from input[1] (known constant).
+      std::vector<int64_t> split_sizes;
+      if (inputs.size() >= 2 && inputs[1]) {
+        std::string splits_name = inputs[1].GetName();
+        if (!splits_name.empty()) {
+          auto it = known_int64_vectors_.find(splits_name);
+          if (it != known_int64_vectors_.end()) {
+            split_sizes = it->second;
+          }
+        }
+      }
+      for (size_t o = 0; o < outputs.size(); ++o) {
+        if (output_names[o].empty() || !outputs[o]) continue;
+        auto [ort_shape, dtype] = GetOrtOutputInfo(o);
+        if (ort_shape.size() != in_dims.size()) continue;
+        std::vector<int64_t> merged(ort_shape.begin(), ort_shape.end());
+        for (size_t i = 0; i < merged.size(); ++i) {
+          if ((int64_t)i == axis) {
+            // Use split size if known.
+            if (merged[i] < 0 && o < split_sizes.size() &&
+                split_sizes[o] >= 0) {
+              merged[i] = split_sizes[o];
+            }
+          } else if (merged[i] < 0 && in_dims[i] >= 0) {
+            merged[i] = in_dims[i];
+          }
+        }
+        StoreRefined(o, BuildVtensorType(merged, GetElementType(dtype)));
+      }
+    }
+    // Concat: merge dims from all refined inputs.
+    // For non-axis dims: use any input that has a known value.
+    // For axis dim: sum all inputs' axis dims if all are known.
+    else if (op_type == "Concat") {
+      auto [ort_shape, dtype] = GetOrtOutputInfo(0);
+      if (ort_shape.size() == in_dims.size()) {
+        int64_t axis = GetIntAttr("axis", 0);
+        if (axis < 0) axis += in_dims.size();
+        std::vector<int64_t> merged(ort_shape.begin(), ort_shape.end());
+        // Collect refined dims from all inputs.
+        for (size_t inp_idx = 0; inp_idx < inputs.size(); ++inp_idx) {
+          if (!inputs[inp_idx]) continue;
+          std::string iname = inputs[inp_idx].GetName();
+          if (iname.empty()) continue;
+          std::string itype = GetVtensorType(iname, inputs[inp_idx].TypeInfo());
+          std::vector<int64_t> idims;
+          std::string ielem;
+          if (!ParseVtensorType(itype, idims, ielem)) continue;
+          if (idims.size() != merged.size()) continue;
+          for (size_t i = 0; i < merged.size(); ++i) {
+            if ((int64_t)i != axis && merged[i] < 0 && idims[i] >= 0) {
+              merged[i] = idims[i];
+            }
+          }
+        }
+        // For the axis dim: sum all inputs if all have known axis sizes.
+        if (merged[axis] < 0) {
+          int64_t total = 0;
+          bool all_known = true;
+          for (size_t inp_idx = 0; inp_idx < inputs.size(); ++inp_idx) {
+            if (!inputs[inp_idx]) { all_known = false; break; }
+            std::string iname = inputs[inp_idx].GetName();
+            if (iname.empty()) { all_known = false; break; }
+            std::string itype = GetVtensorType(iname, inputs[inp_idx].TypeInfo());
+            std::vector<int64_t> idims;
+            std::string ielem;
+            if (!ParseVtensorType(itype, idims, ielem) ||
+                idims.size() != merged.size() || idims[axis] < 0) {
+              all_known = false;
+              break;
+            }
+            total += idims[axis];
+          }
+          if (all_known) merged[axis] = total;
+        }
+        StoreRefined(0, BuildVtensorType(merged, GetElementType(dtype)));
+      }
+    }
+    // TopK: preserves all dims except the axis dim. Has 2 outputs.
+    else if (op_type == "TopK") {
+      int64_t axis = GetIntAttr("axis", -1);
+      if (axis < 0) axis += in_dims.size();
+      for (size_t o = 0; o < outputs.size(); ++o) {
+        if (o >= output_names.size() || output_names[o].empty() || !outputs[o])
+          continue;
+        auto out_info = outputs[o].TypeInfo().GetTensorTypeAndShapeInfo();
+        auto ort_shape = out_info.GetShape();
+        auto dtype = out_info.GetElementType();
+        if (ort_shape.size() == in_dims.size()) {
+          std::vector<int64_t> merged(ort_shape.begin(), ort_shape.end());
+          for (size_t i = 0; i < merged.size(); ++i) {
+            if ((int64_t)i != axis && merged[i] < 0 && in_dims[i] >= 0) {
+              merged[i] = in_dims[i];
+            }
+          }
+          StoreRefined(o, BuildVtensorType(merged, GetElementType(dtype)));
+        }
+      }
+    }
+    // Expand: output shape is determined by the shape tensor (input[1]),
+    // broadcasting with the input shape. Resolve shape tensor to get
+    // known dims.
+    else if (op_type == "Expand") {
+      auto [ort_shape, dtype] = GetOrtOutputInfo(0);
+      // Try to resolve the shape tensor (input[1]).
+      if (inputs.size() >= 2 && inputs[1]) {
+        std::string shape_name = inputs[1].GetName();
+        if (!shape_name.empty()) {
+          std::vector<int64_t> shape_vals;
+          if (ResolveShapeVector(shape_name, shape_vals) &&
+              shape_vals.size() == in_dims.size()) {
+            // Compute broadcast output: for each dim, if shape_val > 0
+            // use it; if shape_val is 1 use input dim; otherwise dynamic.
+            std::vector<int64_t> merged(shape_vals.size());
+            for (size_t i = 0; i < merged.size(); ++i) {
+              if (shape_vals[i] > 1) {
+                merged[i] = shape_vals[i];
+              } else if (shape_vals[i] == 1) {
+                // Expand with 1 keeps input dim.
+                merged[i] = in_dims[i];
+              } else {
+                // Dynamic shape dim — use input dim if known and > 1,
+                // otherwise stay dynamic.
+                merged[i] = (in_dims[i] > 1) ? in_dims[i] : -1;
+              }
+            }
+            StoreRefined(0, BuildVtensorType(merged, GetElementType(dtype)));
+          } else if (ort_shape.size() == in_dims.size()) {
+            // Fallback: propagate input dims where ORT output is unknown.
+            std::vector<int64_t> merged(ort_shape.begin(), ort_shape.end());
+            for (size_t i = 0; i < merged.size(); ++i) {
+              if (merged[i] < 0 && in_dims[i] >= 0) merged[i] = in_dims[i];
+            }
+            StoreRefined(0, BuildVtensorType(merged, GetElementType(dtype)));
+          }
+        }
+      }
+    }
+    // Unsqueeze/Squeeze: propagate matching dims.
+    else if (op_type == "Unsqueeze" || op_type == "Squeeze") {
+      auto [ort_shape, dtype] = GetOrtOutputInfo(0);
+      if (ort_shape.size() == in_dims.size()) {
+        std::vector<int64_t> merged(ort_shape.begin(), ort_shape.end());
+        for (size_t i = 0; i < merged.size(); ++i) {
+          if (merged[i] < 0 && in_dims[i] >= 0) merged[i] = in_dims[i];
+        }
+        StoreRefined(0, BuildVtensorType(merged, GetElementType(dtype)));
+      }
+    }
+    // Gather: output shape = data shape with axis dim replaced by indices shape.
+    // For axis=0: data[D0,D1,...] + indices[I0,...] → [I0,...,D1,...]
+    // Propagate known static dims from data to output.
+    else if (op_type == "Gather") {
+      auto [ort_shape, dtype] = GetOrtOutputInfo(0);
+      int64_t axis = 0;
+      for (const auto& attr : attrs) {
+        if (attr.GetName() == "axis") {
+          int64_t val = 0;
+          attr.GetValue(val);
+          axis = val;
+        }
+      }
+      if (axis < 0) axis += static_cast<int64_t>(in_dims.size());
+      // Get indices shape.
+      std::vector<int64_t> idx_dims;
+      std::string idx_elem;
+      if (inputs.size() >= 2 && inputs[1]) {
+        std::string idx_type = GetVtensorType(inputs[1].GetName(),
+                                              inputs[1].TypeInfo());
+        ParseVtensorType(idx_type, idx_dims, idx_elem);
+      }
+      // Build expected output: indices_dims + data_dims (skipping axis).
+      std::vector<int64_t> expected;
+      for (int64_t i = 0; i < axis; ++i) expected.push_back(in_dims[i]);
+      for (auto d : idx_dims) expected.push_back(d);
+      for (size_t i = axis + 1; i < in_dims.size(); ++i)
+        expected.push_back(in_dims[i]);
+      if (expected.size() == ort_shape.size()) {
+        std::vector<int64_t> merged(ort_shape.begin(), ort_shape.end());
+        bool improved = false;
+        for (size_t i = 0; i < merged.size(); ++i) {
+          if (merged[i] < 0 && expected[i] >= 0) {
+            merged[i] = expected[i];
+            improved = true;
+          }
+        }
+        if (improved) {
+          StoreRefined(0, BuildVtensorType(merged, GetElementType(dtype)));
+        }
+      }
+    }
+    // DequantizeLinear: output has same shape as input, different dtype.
+    else if (op_type == "DequantizeLinear") {
+      auto [ort_shape, dtype] = GetOrtOutputInfo(0);
+      if (ort_shape.size() == in_dims.size()) {
+        std::vector<int64_t> merged(ort_shape.begin(), ort_shape.end());
+        for (size_t i = 0; i < merged.size(); ++i) {
+          if (merged[i] < 0 && in_dims[i] >= 0) merged[i] = in_dims[i];
+        }
+        StoreRefined(0, BuildVtensorType(merged, GetElementType(dtype)));
+      }
+    }
+  }
+
+  // Get the vtensor type string for a named value. Uses refined type if
+  // available, otherwise falls back to ORT's type info.
+  std::string GetVtensorType(const std::string& name,
+                             const Ort::ConstTypeInfo& type_info) {
+    auto it = refined_types_.find(name);
+    if (it != refined_types_.end()) return it->second;
+    return FormatTensorType(type_info);
+  }
+
+  std::string RefineReshapeOutputType(const Ort::ConstNode& node) {
+    auto inputs = node.GetInputs();
+    if (inputs.size() < 2 || !inputs[1]) return "";
+
+    auto outputs = node.GetOutputs();
+    if (outputs.empty() || !outputs[0]) return "";
+
+    // Get the shape tensor name.
+    std::string shape_name = inputs[1].GetName();
+
+    // Try to resolve the shape vector to concrete values.
+    std::vector<int64_t> shape_values;
+    if (!ResolveShapeVector(shape_name, shape_values)) return "";
+
+    // Check if we actually improved anything.
+    auto output_info = outputs[0].TypeInfo().GetTensorTypeAndShapeInfo();
+    auto ort_shape = output_info.GetShape();
+    if (ort_shape.size() != shape_values.size()) return "";
+
+    bool improved = false;
+    for (size_t i = 0; i < ort_shape.size(); ++i) {
+      if (ort_shape[i] < 0 && shape_values[i] >= 0) {
+        improved = true;
+        break;
+      }
+    }
+    if (!improved) return "";
+
+    // Build refined type string.
+    auto dtype = output_info.GetElementType();
+    std::ostringstream ss;
+    ss << "!torch.vtensor<[";
+    for (size_t i = 0; i < shape_values.size(); ++i) {
+      if (i > 0) ss << ",";
+      if (shape_values[i] < 0) {
+        // Use ORT's value if it knew it, otherwise dynamic.
+        if (ort_shape[i] >= 0) {
+          ss << ort_shape[i];
+        } else {
+          ss << "?";
+        }
+      } else {
+        ss << shape_values[i];
+      }
+    }
+    ss << "]," << GetElementType(dtype) << ">";
+    std::string result = ss.str();
+
+    // Store the refined type so downstream ops use the correct type.
+    std::string output_name = outputs[0].GetName();
+    if (!output_name.empty()) {
+      refined_types_[output_name] = result;
+    }
+    return result;
+  }
+
+  // Try to resolve a tensor name to a vector of int64 values.
+  // Returns true if we could determine at least some values.
+  // Values of -1 mean "dynamic/unknown".
+  // If unknown_count is provided, it is set to the number of truly
+  // unresolvable values (vs -1 from known constants like ONNX infer).
+  bool ResolveShapeVector(const std::string& name,
+                          std::vector<int64_t>& values,
+                          int* unknown_count = nullptr) {
+    if (unknown_count) *unknown_count = 0;
+
+    // Case 1: Direct constant initializer.
+    auto it = known_int64_vectors_.find(name);
+    if (it != known_int64_vectors_.end()) {
+      values = it->second;
+      return true;
+    }
+
+    // Case 2: Produced by a known op — resolve through producer chain.
+    auto prod_it = producer_info_.find(name);
+    if (prod_it != producer_info_.end()) {
+      const auto& info = prod_it->second;
+      if (info.op_type == "Concat") {
+        values.clear();
+        for (const auto& input_name : info.input_names) {
+          auto inp_it = known_int64_vectors_.find(input_name);
+          if (inp_it != known_int64_vectors_.end()) {
+            // Known constant — append all values.
+            values.insert(values.end(), inp_it->second.begin(),
+                          inp_it->second.end());
+          } else {
+            // Unknown — mark as dynamic. Assume it contributes 1 element
+            // (most shape concat inputs are scalar-as-1d).
+            values.push_back(-1);
+            if (unknown_count) (*unknown_count)++;
+          }
+        }
+        return !values.empty();
+      }
+      // Reshape with [-1] is identity for 1-D shape tensors — trace input.
+      if (info.op_type == "Reshape" && !info.input_names.empty()) {
+        return ResolveShapeVector(info.input_names[0], values, unknown_count);
+      }
+      // Where(cond, true_val, false_val): trace the false branch.
+      // This handles the ONNX Expand shape pattern:
+      //   Where(Equal(shape, -1), ones, shape) → shape (when no -1 dims).
+      if (info.op_type == "Where" && info.input_names.size() >= 3) {
+        return ResolveShapeVector(info.input_names[2], values, unknown_count);
+      }
+    }
+
+    return false;
+  }
+
+  // Build maps for shape refinement. Called after CollectMetadata().
+  void BuildShapeRefinementMaps() {
+    // Read constant values from small int64 initializers.
+    for (const auto& init : initializers_) {
+      auto type_info = init.TypeInfo();
+      if (type_info.GetONNXType() != ONNX_TYPE_TENSOR) continue;
+
+      auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
+      if (tensor_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64)
+        continue;
+
+      size_t count = tensor_info.GetElementCount();
+      if (count > 16) continue;  // Only track small tensors.
+
+      Ort::ConstValue tensor_value{nullptr};
+      auto status = init.GetInitializer(tensor_value);
+      if (!status.IsOK()) continue;
+
+      const auto* data =
+          static_cast<const int64_t*>(tensor_value.GetTensorRawData());
+      std::vector<int64_t> vals(data, data + count);
+      known_int64_vectors_[init.GetName()] = std::move(vals);
+    }
+
+    // Build producer map and value-info lookup from graph nodes.
+    auto nodes = graph_.GetNodes();
+    // Map output name → ConstValueInfo for ORT type info lookups.
+    std::unordered_map<std::string, Ort::ConstValueInfo> value_info_map;
+
+    for (const auto& node : nodes) {
+      std::string op_type = node.GetOperatorType();
+      auto inputs = node.GetInputs();
+      auto outputs = node.GetOutputs();
+
+      // Record producer info for all outputs.
+      ProducerInfo info;
+      info.op_type = op_type;
+      for (const auto& inp : inputs) {
+        if (inp) info.input_names.push_back(inp.GetName());
+      }
+      for (const auto& out : outputs) {
+        if (out) {
+          std::string out_name = out.GetName();
+          if (!out_name.empty()) {
+            producer_info_[out_name] = info;
+            value_info_map.emplace(out_name, out);
+          }
+        }
+      }
+    }
+
+    // Also add graph inputs and initializers to value_info_map.
+    for (const auto& gi : graph_inputs_) {
+      if (gi) value_info_map.emplace(gi.GetName(), gi);
+    }
+    for (const auto& init : initializers_) {
+      if (init) value_info_map.emplace(init.GetName(), init);
+    }
+
+    // Multi-pass: propagate known values through the graph until convergence.
+    // Handles chains like: Constant → Gather(Shape(tensor), idx) → Unsqueeze → Concat
+    for (int pass = 0; pass < 3; ++pass) {
+      size_t prev_size = known_int64_vectors_.size();
+
+      for (const auto& node : nodes) {
+        std::string op_type = node.GetOperatorType();
+        auto inputs = node.GetInputs();
+        auto outputs = node.GetOutputs();
+
+        // Unsqueeze: propagate known scalar.
+        if (op_type == "Unsqueeze" && inputs.size() >= 1 && inputs[0]) {
+          auto it = known_int64_vectors_.find(inputs[0].GetName());
+          if (it != known_int64_vectors_.end() && it->second.size() == 1) {
+            for (const auto& out : outputs) {
+              if (out && !out.GetName().empty()) {
+                known_int64_vectors_.emplace(out.GetName(), it->second);
+              }
+            }
+          }
+        }
+
+        // Gather(Shape(tensor), constant_index) → extract specific dim.
+        if (op_type == "Gather" && inputs.size() >= 2 &&
+            inputs[0] && inputs[1]) {
+          std::string shape_out = inputs[0].GetName();
+          std::string index_name = inputs[1].GetName();
+
+          auto idx_it = known_int64_vectors_.find(index_name);
+          if (idx_it != known_int64_vectors_.end() &&
+              idx_it->second.size() == 1) {
+            int64_t gather_idx = idx_it->second[0];
+
+            // Check if input[0] was produced by a Shape op.
+            auto shape_prod = producer_info_.find(shape_out);
+            if (shape_prod != producer_info_.end() &&
+                shape_prod->second.op_type == "Shape" &&
+                !shape_prod->second.input_names.empty()) {
+              std::string shape_src = shape_prod->second.input_names[0];
+              auto vi_it = value_info_map.find(shape_src);
+              if (vi_it != value_info_map.end()) {
+                auto src_shape = vi_it->second.TypeInfo()
+                                     .GetTensorTypeAndShapeInfo()
+                                     .GetShape();
+                if (gather_idx < 0)
+                  gather_idx += static_cast<int64_t>(src_shape.size());
+                if (gather_idx >= 0 &&
+                    gather_idx < static_cast<int64_t>(src_shape.size())) {
+                  int64_t dim_val = src_shape[gather_idx];
+                  if (dim_val >= 0) {
+                    for (const auto& out : outputs) {
+                      if (out && !out.GetName().empty()) {
+                        known_int64_vectors_.emplace(out.GetName(),
+                                                     std::vector<int64_t>{dim_val});
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+
+      // Stop early if no new values were discovered.
+      if (known_int64_vectors_.size() == prev_size) break;
+    }
+
+    // Pre-compute refined types for all nodes so they're available when
+    // emitting the function signature (which needs output types before the
+    // function body is emitted).
+    for (const auto& node : nodes) {
+      std::string op_type = node.GetOperatorType();
+      auto inputs = node.GetInputs();
+      auto outputs = node.GetOutputs();
+      auto attrs = node.GetAttributes();
+
+      // First try Reshape refinement.
+      if (op_type == "Reshape") {
+        RefineReshapeOutputType(node);
+      }
+
+      // Build output names and type strings.
+      std::vector<std::string> output_names;
+      std::vector<std::string> output_type_strs;
+      for (const auto& out : outputs) {
+        if (out) {
+          std::string name = out.GetName();
+          output_names.push_back(name);
+          output_type_strs.push_back(
+              GetVtensorType(name, out.TypeInfo()));
+        } else {
+          output_names.push_back("");
+          output_type_strs.push_back("");
+        }
+      }
+
+      // Convert inputs/outputs to ConstValueInfo vectors.
+      std::vector<Ort::ConstValueInfo> inp_infos(inputs.begin(), inputs.end());
+      std::vector<Ort::ConstValueInfo> out_infos(outputs.begin(), outputs.end());
+
+      PropagateRefinedTypes(op_type, inp_infos, out_infos, attrs,
+                            output_names, output_type_strs);
+    }
+  }
+
+  // Emits a Reduce op with axes as an attribute instead of a tensor input.
+  // Converts opset 18+ format (axes as input[1]) to opset 17 format (axes as
+  // attribute) for compatibility with torch-mlir's ONNX conversion patterns.
+  OrtStatus* EmitReduceWithAxesAttr(const Ort::ConstNode& node,
+                                    const std::string& op_type,
+                                    const std::vector<int64_t>& axes) {
+    auto inputs = node.GetInputs();
+    auto outputs = node.GetOutputs();
+    auto attrs = node.GetAttributes();
+
+    // Build output name and type.
+    std::string out_name = SanitizeName(outputs[0].GetName());
+    std::string out_type = GetVtensorType(outputs[0].GetName(),
+                                          outputs[0].TypeInfo());
+
+    // Build data input reference (input[0] only, skip axes tensor).
+    std::string data_name = SanitizeName(inputs[0].GetName());
+    std::string data_type = GetVtensorType(inputs[0].GetName(),
+                                           inputs[0].TypeInfo());
+
+    // Build attributes: keep existing attrs (keepdims, etc.) but add axes
+    // and skip noop_with_empty_axes (opset 18+ only).
+    std::ostringstream attr_ss;
+    bool first = true;
+    for (const auto& attr : attrs) {
+      std::string name = attr.GetName();
+      if (name == "noop_with_empty_axes") continue;  // opset 18+ only
+      if (!first) attr_ss << ", ";
+      first = false;
+      attr_ss << FormatAttribute(attr);
+    }
+    // Add axes as attribute.
+    if (!first) attr_ss << ", ";
+    std::ostringstream axes_ss;
+    axes_ss << "torch.onnx.axes = [";
+    for (size_t i = 0; i < axes.size(); ++i) {
+      if (i > 0) axes_ss << ", ";
+      axes_ss << axes[i] << " : si64";
+    }
+    axes_ss << "]";
+    attr_ss << axes_ss.str();
+
+    out_ << std::format(
+        "    %{0} = torch.operator \"onnx.{1}\"(%{2}) {{{3}}} : ({4}) -> {5}\n",
+        out_name, op_type, data_name, attr_ss.str(), data_type, out_type);
+
+    return nullptr;
+  }
+
+  // Emits a reshape operation using torch.aten.reshape.
+  // Emits torch.constant.int for each dimension (using -1 for dynamic dims),
+  // torch.prim.ListConstruct for the shape list, and torch.aten.reshape.
+  void EmitReshapeFromDims(const std::string& result_name,
+                           const std::string& input_name,
+                           const std::string& input_type,
+                           const std::vector<int64_t>& target_dims,
+                           const std::string& result_type) {
+    std::vector<std::string> dim_names;
+    for (size_t i = 0; i < target_dims.size(); ++i) {
+      std::string dname = result_name + "_d" + std::to_string(i);
+      int64_t val = target_dims[i] < 0 ? -1 : target_dims[i];
+      out_ << std::format("    %{} = torch.constant.int {}\n", dname, val);
+      dim_names.push_back(dname);
+    }
+    std::ostringstream refs, types;
+    for (size_t i = 0; i < dim_names.size(); ++i) {
+      if (i > 0) { refs << ", "; types << ", "; }
+      refs << "%" << dim_names[i];
+      types << "!torch.int";
+    }
+    std::string list_name = result_name + "_shape";
+    out_ << std::format(
+        "    %{0} = torch.prim.ListConstruct {1} : ({2}) -> !torch.list<int>\n",
+        list_name, refs.str(), types.str());
+    out_ << std::format(
+        "    %{0} = torch.aten.reshape %{1}, %{2} : {3}, !torch.list<int> -> {4}\n",
+        result_name, input_name, list_name, input_type, result_type);
+  }
+
+  // Decomposes DequantizeLinear with block_size into arithmetic ops.
+  //
+  // DequantizeLinear(x, scale, zero_point, axis=A, block_size=B):
+  //   x:     [..., K, ...] uint8 (one INT4 value per byte)
+  //   scale: [..., G, ...] f16   where G = K / B
+  //   zero:  [..., G, ...] uint8
+  //   out:   [..., K, ...] f16
+  //
+  // Decomposition:
+  //   1. Reshape x:      [..., K, ...]     → [..., G, B, ...]
+  //   2. Cast x:         uint8             → f16
+  //   3. Unsqueeze zero: [..., G, ...]     → [..., G, 1, ...]
+  //   4. Cast zero:      uint8             → f16
+  //   5. Sub:            x_f16 - zero_f16  (broadcasts along block dim)
+  //   6. Unsqueeze scale:[..., G, ...]     → [..., G, 1, ...]
+  //   7. Mul:            diff * scale      (broadcasts along block dim)
+  //   8. Reshape result: [..., G, B, ...]  → [..., K, ...]
+  OrtStatus* EmitBlockedDequantizeLinear(const Ort::ConstNode& node) {
+    auto inputs = node.GetInputs();
+    auto outputs = node.GetOutputs();
+    auto attrs = node.GetAttributes();
+
+    // Parse attributes.
+    int64_t axis = 1;  // ONNX DequantizeLinear default
+    int64_t block_size = 0;
+    for (const auto& attr : attrs) {
+      std::string name = attr.GetName();
+      if (name == "axis") attr.GetValue(axis);
+      else if (name == "block_size") attr.GetValue(block_size);
+    }
+
+    // Get input/output names.
+    std::string x_ssa = SanitizeName(inputs[0].GetName());
+    std::string s_ssa = SanitizeName(inputs[1].GetName());
+    bool has_zp = inputs.size() > 2 && inputs[2] &&
+                  !inputs[2].GetName().empty();
+    std::string z_ssa = has_zp ? SanitizeName(inputs[2].GetName()) : "";
+    std::string out_ssa = SanitizeName(outputs[0].GetName());
+
+    // Get types (using refined types if available).
+    std::string x_type = GetVtensorType(inputs[0].GetName(),
+                                        inputs[0].TypeInfo());
+    std::string s_type = GetVtensorType(inputs[1].GetName(),
+                                        inputs[1].TypeInfo());
+    std::string z_type = has_zp
+        ? GetVtensorType(inputs[2].GetName(), inputs[2].TypeInfo())
+        : "";
+
+    // Parse shapes.
+    std::vector<int64_t> x_dims, s_dims, z_dims;
+    std::string x_elem, s_elem, z_elem;
+    if (!ParseVtensorType(x_type, x_dims, x_elem))
+      return MakeError("DequantizeLinear: failed to parse input type: {}",
+                       x_type);
+    if (!ParseVtensorType(s_type, s_dims, s_elem))
+      return MakeError("DequantizeLinear: failed to parse scale type: {}",
+                       s_type);
+    if (has_zp && !ParseVtensorType(z_type, z_dims, z_elem))
+      return MakeError("DequantizeLinear: failed to parse zero_point type: {}",
+                       z_type);
+
+    // Get output element type.
+    auto out_info = outputs[0].TypeInfo().GetTensorTypeAndShapeInfo();
+    auto out_dtype_enum = out_info.GetElementType();
+    std::string out_elem = GetElementType(out_dtype_enum);
+    // ORT's ONNXTensorElementDataType matches ONNX's TensorProto.DataType.
+    int64_t onnx_dtype_int = static_cast<int64_t>(out_dtype_enum);
+
+    // Normalize axis.
+    int64_t rank = static_cast<int64_t>(x_dims.size());
+    if (axis < 0) axis += rank;
+
+    // Get K (size along quantized axis) and compute G = K / block_size.
+    int64_t K = x_dims[axis];
+    if (K <= 0)
+      return MakeError(
+          "DequantizeLinear: quantized axis {} has dynamic size", axis);
+    if (K % block_size != 0)
+      return MakeError(
+          "DequantizeLinear: axis size {} not divisible by block_size {}",
+          K, block_size);
+    int64_t G = K / block_size;
+
+    // Unique prefix for intermediate SSA names.
+    std::string p = out_ssa + "_bdq_";
+
+    // --- Compute intermediate shapes ---
+
+    // x_4d: split quantized axis into [G, block_size].
+    std::vector<int64_t> x_4d_dims(x_dims);
+    x_4d_dims[axis] = G;
+    x_4d_dims.insert(x_4d_dims.begin() + axis + 1, block_size);
+
+    // s_4d: unsqueeze scale at axis+1.
+    std::vector<int64_t> s_4d_dims(s_dims);
+    s_4d_dims.insert(s_4d_dims.begin() + axis + 1, 1);
+
+    // --- Build intermediate type strings ---
+    std::string x_4d_type = BuildVtensorType(x_4d_dims, x_elem);
+    std::string x_4d_cast_type = BuildVtensorType(x_4d_dims, out_elem);
+    std::string s_4d_type = BuildVtensorType(s_4d_dims, s_elem);
+
+    // --- Step 1: Reshape x to [..., G, block_size, ...] ---
+    EmitReshapeFromDims(p + "x4d", x_ssa, x_type, x_4d_dims, x_4d_type);
+
+    // --- Step 2: Cast x from uint8 to output dtype (e.g., f16) ---
+    out_ << std::format(
+        "    %{0} = torch.operator \"onnx.Cast\"(%{1}) "
+        "{{torch.onnx.to = {2} : si64}} : ({3}) -> {4}\n",
+        p + "xf", p + "x4d", onnx_dtype_int, x_4d_type, x_4d_cast_type);
+
+    std::string arith_input = p + "xf";
+
+    // --- Steps 3-5: Handle zero point (if present) ---
+    if (has_zp) {
+      // Unsqueeze zero point at axis+1.
+      std::vector<int64_t> z_4d_dims(z_dims);
+      z_4d_dims.insert(z_4d_dims.begin() + axis + 1, 1);
+      std::string z_4d_type = BuildVtensorType(z_4d_dims, z_elem);
+      std::string z_4d_cast_type = BuildVtensorType(z_4d_dims, out_elem);
+
+      out_ << std::format("    %{0} = torch.constant.int {1}\n",
+                          p + "z_dim", axis + 1);
+      out_ << std::format(
+          "    %{0} = torch.aten.unsqueeze %{1}, %{2} : {3}, "
+          "!torch.int -> {4}\n",
+          p + "z4d", z_ssa, p + "z_dim", z_type, z_4d_type);
+
+      // Cast zero from uint8 to output dtype.
+      out_ << std::format(
+          "    %{0} = torch.operator \"onnx.Cast\"(%{1}) "
+          "{{torch.onnx.to = {2} : si64}} : ({3}) -> {4}\n",
+          p + "zf", p + "z4d", onnx_dtype_int, z_4d_type, z_4d_cast_type);
+
+      // Subtract: x - zero (broadcasts along block dim).
+      out_ << std::format(
+          "    %{0} = torch.operator \"onnx.Sub\"(%{1}, %{2}) {{}} : "
+          "({3}, {4}) -> {5}\n",
+          p + "diff", p + "xf", p + "zf",
+          x_4d_cast_type, z_4d_cast_type, x_4d_cast_type);
+
+      arith_input = p + "diff";
+    }
+
+    // --- Step 6: Unsqueeze scale at axis+1 ---
+    out_ << std::format("    %{0} = torch.constant.int {1}\n",
+                        p + "s_dim", axis + 1);
+    out_ << std::format(
+        "    %{0} = torch.aten.unsqueeze %{1}, %{2} : {3}, "
+        "!torch.int -> {4}\n",
+        p + "s4d", s_ssa, p + "s_dim", s_type, s_4d_type);
+
+    // --- Step 7: Multiply diff * scale (broadcasts along block dim) ---
+    out_ << std::format(
+        "    %{0} = torch.operator \"onnx.Mul\"(%{1}, %{2}) {{}} : "
+        "({3}, {4}) -> {5}\n",
+        p + "result", arith_input, p + "s4d",
+        x_4d_cast_type, s_4d_type, x_4d_cast_type);
+
+    // --- Step 8: Reshape back to original shape ---
+    auto ref_it = refined_types_.find(outputs[0].GetName());
+    std::string final_type = ref_it != refined_types_.end()
+        ? ref_it->second
+        : FormatTensorType(outputs[0].TypeInfo());
+    std::vector<int64_t> out_dims;
+    std::string out_e;
+    ParseVtensorType(final_type, out_dims, out_e);
+
+    EmitReshapeFromDims(out_ssa, p + "result", x_4d_cast_type,
+                        out_dims, final_type);
+
+    return nullptr;
+  }
+
+  struct ProducerInfo {
+    std::string op_type;
+    std::vector<std::string> input_names;
+  };
 
   // Member variables.
   const Ort::ConstGraph& graph_;
@@ -983,8 +2693,26 @@ class MlirGenerator {
   std::vector<Ort::ConstValueInfo> initializers_;
   std::vector<ParameterInitializer> parameter_initializers_;
 
+  // Shape refinement maps.
+  std::unordered_map<std::string, std::vector<int64_t>> known_int64_vectors_;
+  std::unordered_map<std::string, ProducerInfo> producer_info_;
+  // Refined vtensor type strings for outputs whose shapes we've improved.
+  std::unordered_map<std::string, std::string> refined_types_;
+
   // Extern dispatch state.
   int extern_id_ = 0;
+
+  // Counter for unique constant shape tensor names.
+  int const_shape_counter_ = 0;
+
+  // Maps Shape op output name → {source tensor name, source tensor type}.
+  // Used to rewrite Gather(Shape(tensor), idx) → torch.aten.size.int.
+  std::unordered_map<std::string, std::pair<std::string, std::string>>
+      shape_source_map_;
+
+  // Maps Gather output name → size.int SSA name (the !torch.int result).
+  // Populated when Gather(Shape(tensor), idx) is rewritten to size.int.
+  std::unordered_map<std::string, std::string> size_int_ssa_map_;
 };
 
 // Builds an IRPA parameter archive for large initializers.
@@ -1089,10 +2817,18 @@ OrtStatus* MlirGenerator::BuildParameterArchive(
         iree_make_string_view(filepath.data(), filepath.size()), allocator,
         ext_handle.ForOutput()));
 
+    // Compute byte size from tensor shape if external data lacks length field.
+    size_t byte_size = ext_info.GetByteSize();
+    if (byte_size == 0) {
+      auto tensor_info = init.TypeInfo().GetTensorTypeAndShapeInfo();
+      byte_size = tensor_info.GetElementCount() *
+                  OnnxElementTypeSize(tensor_info.GetElementType());
+    }
+
     iree_io_parameter_index_entry_t entry = {};
     entry.key = iree_make_string_view(param.sanitized_name.data(),
                                       param.sanitized_name.size());
-    entry.length = ext_info.GetByteSize();
+    entry.length = byte_size;
     entry.type = IREE_IO_PARAMETER_INDEX_ENTRY_STORAGE_TYPE_FILE;
     entry.storage.file.handle = ext_handle.Get();
     entry.storage.file.offset = static_cast<uint64_t>(ext_info.GetFileOffset());
