@@ -297,6 +297,10 @@ class MlirGenerator {
       std::string name = SanitizeName(graph_inputs_[i].GetName());
       std::string type = FormatTensorType(graph_inputs_[i].TypeInfo());
       args << "%" << name << ": " << type;
+      // Store graph input types as refined types so free dimension overrides
+      // (e.g., seq_len=1 for decode) propagate through the entire graph.
+      // Without this, node-level TypeInfo returns original dynamic shapes.
+      refined_types_[graph_inputs_[i].GetName()] = type;
     }
 
     // Build return types (use refined types if available).
@@ -1082,6 +1086,46 @@ class MlirGenerator {
       }
     }
 
+    // Eliminate Cast→Cast roundtrips (e.g., f16→f32→f16 after Softmax).
+    // When Cast(B→A) consumes Cast(A→B), skip both and alias the output
+    // to the original input. The first Cast becomes dead code (DCE'd by MLIR).
+    if (op_type == "Cast" && inputs.size() >= 1 && inputs[0] &&
+        outputs.size() >= 1 && outputs[0]) {
+      std::string cast_input_name = ResolveAlias(inputs[0].GetName());
+      auto prod_it = producer_info_.find(cast_input_name);
+      if (prod_it != producer_info_.end() &&
+          prod_it->second.op_type == "Cast" &&
+          !prod_it->second.input_names.empty()) {
+        std::string orig_input = prod_it->second.input_names[0];
+
+        // Compare element types: intermediate (this Cast's input) vs output.
+        std::string intermediate_type = GetVtensorType(cast_input_name,
+            inputs[0].TypeInfo());
+        std::vector<int64_t> inter_dims;
+        std::string inter_elem;
+        ParseVtensorType(intermediate_type, inter_dims, inter_elem);
+
+        auto out_dtype = outputs[0].TypeInfo().GetTensorTypeAndShapeInfo()
+            .GetElementType();
+        std::string out_elem = GetElementType(out_dtype);
+
+        // Roundtrip if: this Cast changes type back (inter_elem != out_elem).
+        if (inter_elem != out_elem) {
+          std::string orig_resolved = ResolveAlias(orig_input);
+          cast_aliases_[outputs[0].GetName()] = orig_resolved;
+          auto orig_ref = refined_types_.find(orig_input);
+          if (orig_ref != refined_types_.end()) {
+            refined_types_[outputs[0].GetName()] = orig_ref->second;
+          }
+          producer_info_[outputs[0].GetName()] = prod_it->second;
+          // Debug: fprintf(stderr, "IREE EP: Eliminated Cast roundtrip: "
+          //     "%s -> %s -> %s\n", orig_resolved.c_str(),
+          //     cast_input_name.c_str(), outputs[0].GetName().c_str());
+          return nullptr;
+        }
+      }
+    }
+
     // For Reshape, try to refine the output shape by tracing constant values
     // through the shape tensor (ORT loses this info through Concat chains).
     std::string refined_reshape_type;
@@ -1305,8 +1349,9 @@ class MlirGenerator {
         in_types << std::format("!torch.vtensor<[{}],si64>",
             inputs[i].TypeInfo().GetTensorTypeAndShapeInfo().GetShape()[0]);
       } else {
-        in_names << "%" << SanitizeName(input_name);
-        in_types << GetVtensorType(input_name, inputs[i].TypeInfo());
+        std::string resolved = ResolveAlias(input_name);
+        in_names << "%" << SanitizeName(resolved);
+        in_types << GetVtensorType(resolved, inputs[i].TypeInfo());
       }
     }
 
@@ -2125,6 +2170,37 @@ class MlirGenerator {
         StoreRefined(0, BuildVtensorType(merged, GetElementType(dtype)));
       }
     }
+    // Gather(data, indices, axis): output shape = indices_shape spliced into
+    // data_shape. For axis=0: output = indices_shape + data_shape[1:].
+    // Propagates static dims from both data and indices tensors.
+    else if (op_type == "Gather") {
+      int64_t axis = GetIntAttr("axis", 0);
+      if (axis < 0) axis += static_cast<int64_t>(in_dims.size());
+      auto [ort_shape, dtype] = GetOrtOutputInfo(0);
+      // Get indices shape (from refined types or ORT).
+      if (inputs.size() >= 2 && inputs[1]) {
+        std::string idx_name = inputs[1].GetName();
+        std::string idx_type = GetVtensorType(idx_name, inputs[1].TypeInfo());
+        std::vector<int64_t> idx_dims;
+        std::string idx_elem;
+        if (ParseVtensorType(idx_type, idx_dims, idx_elem) &&
+            ort_shape.size() == idx_dims.size() + in_dims.size() - 1) {
+          std::vector<int64_t> merged(ort_shape.begin(), ort_shape.end());
+          // Output shape: data_shape[:axis] + indices_shape + data_shape[axis+1:]
+          size_t out_i = 0;
+          for (int64_t d = 0; d < axis; ++d, ++out_i) {
+            if (merged[out_i] < 0 && in_dims[d] >= 0) merged[out_i] = in_dims[d];
+          }
+          for (size_t d = 0; d < idx_dims.size(); ++d, ++out_i) {
+            if (merged[out_i] < 0 && idx_dims[d] >= 0) merged[out_i] = idx_dims[d];
+          }
+          for (size_t d = axis + 1; d < in_dims.size(); ++d, ++out_i) {
+            if (merged[out_i] < 0 && in_dims[d] >= 0) merged[out_i] = in_dims[d];
+          }
+          StoreRefined(0, BuildVtensorType(merged, GetElementType(dtype)));
+        }
+      }
+    }
     // TopK: preserves all dims except the axis dim. Has 2 outputs.
     else if (op_type == "TopK") {
       int64_t axis = GetIntAttr("axis", -1);
@@ -2255,8 +2331,15 @@ class MlirGenerator {
   // available, otherwise falls back to ORT's type info.
   std::string GetVtensorType(const std::string& name,
                              const Ort::ConstTypeInfo& type_info) {
-    auto it = refined_types_.find(name);
+    // Resolve aliases from Cast→Cast elimination first.
+    std::string resolved = ResolveAlias(name);
+    auto it = refined_types_.find(resolved);
     if (it != refined_types_.end()) return it->second;
+    // If aliased, also check the original name for refined type.
+    if (resolved != name) {
+      auto it2 = refined_types_.find(name);
+      if (it2 != refined_types_.end()) return it2->second;
+    }
     return FormatTensorType(type_info);
   }
 
@@ -2278,6 +2361,36 @@ class MlirGenerator {
     auto output_info = outputs[0].TypeInfo().GetTensorTypeAndShapeInfo();
     auto ort_shape = output_info.GetShape();
     if (ort_shape.size() != shape_values.size()) return "";
+
+    // Resolve -1 in shape_values using refined input total elements.
+    // ONNX Reshape: exactly one -1 allowed, inferred as total / product(others).
+    int neg_one_idx = -1;
+    int64_t non_neg_product = 1;
+    for (size_t i = 0; i < shape_values.size(); ++i) {
+      if (shape_values[i] == -1) {
+        neg_one_idx = static_cast<int>(i);
+      } else if (shape_values[i] > 0) {
+        non_neg_product *= shape_values[i];
+      }
+    }
+    if (neg_one_idx >= 0 && inputs[0]) {
+      std::string in_type = GetVtensorType(inputs[0].GetName(),
+                                            inputs[0].TypeInfo());
+      std::vector<int64_t> in_dims;
+      std::string in_elem;
+      if (ParseVtensorType(in_type, in_dims, in_elem)) {
+        bool all_static = true;
+        int64_t in_total = 1;
+        for (int64_t d : in_dims) {
+          if (d <= 0) { all_static = false; break; }
+          in_total *= d;
+        }
+        if (all_static && non_neg_product > 0 &&
+            in_total % non_neg_product == 0) {
+          shape_values[neg_one_idx] = in_total / non_neg_product;
+        }
+      }
+    }
 
     bool improved = false;
     for (size_t i = 0; i < ort_shape.size(); ++i) {
@@ -2827,6 +2940,23 @@ class MlirGenerator {
   // Maps Gather output name → size.int SSA name (the !torch.int result).
   // Populated when Gather(Shape(tensor), idx) is rewritten to size.int.
   std::unordered_map<std::string, std::string> size_int_ssa_map_;
+
+  // Maps ONNX output name → aliased ONNX input name for skipped Cast→Cast
+  // roundtrips. When a Cast(A→B) is immediately followed by Cast(B→A) with
+  // the intermediate having only one consumer, both are skipped and the
+  // second output aliases to the first input.
+  std::unordered_map<std::string, std::string> cast_aliases_;
+
+  // Resolves aliases: follows cast_aliases_ chain to find the canonical name.
+  std::string ResolveAlias(const std::string& name) const {
+    std::string cur = name;
+    for (int depth = 0; depth < 10; ++depth) {
+      auto it = cast_aliases_.find(cur);
+      if (it == cast_aliases_.end()) break;
+      cur = it->second;
+    }
+    return cur;
+  }
 };
 
 // Builds an IRPA parameter archive for large initializers.
@@ -3002,6 +3132,11 @@ OrtStatus* GenerateMlir(const Ort::ConstGraph& graph, const OrtApi& /*ort_api*/,
     return MakeError("Failed to write to file: {}", mlir_path);
   }
 
+  // Skip parameter archive building if params are already provided
+  // (e.g., shared from another session via share_weights_key).
+  if (out_provider) {
+    return nullptr;
+  }
   return gen.BuildParameterArchive(out_index, out_provider);
 }
 
