@@ -40,6 +40,12 @@ struct TargetConfig {
   std::string hal_backend;  // e.g., "rocm" (HAL executable target backend)
   std::string hal_format;   // e.g., "rocm-hsaco-fb" (HAL executable format)
 
+  // When > 0, emits torch.symbolic_int + torch.bind_symbolic_shape ops to
+  // tell IREE that dynamic seq_len dimensions are divisible by this value.
+  // IREE's BindSymbolicShapes pass converts these to util.assume.int<udiv=N>,
+  // enabling better tiling and vectorization for dynamic shapes.
+  int seq_len_divisor = 0;
+
   // Creates a TargetConfig, resolving hal_backend/hal_format from backend.
   static TargetConfig Create(const std::string& target_arch,
                              const std::string& backend);

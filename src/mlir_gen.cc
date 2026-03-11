@@ -229,6 +229,7 @@ class MlirGenerator {
     BuildShapeRefinementMaps();
     OrtStatus* status = EmitModuleHeader();
     if (status) return status;
+    EmitSymbolicShapeBindings();
     status = EmitFunctionBody();
     if (status) return status;
     EmitModuleFooter();
@@ -338,6 +339,119 @@ class MlirGenerator {
                         ir_version_,      // {3}
                         opset_version_);  // {4}
     return nullptr;
+  }
+
+  // Emits torch.symbolic_int + torch.bind_symbolic_shape ops for input tensors
+  // with dynamic dimensions when seq_len_divisor is configured. This tells
+  // IREE's BindSymbolicShapes pass to insert util.assume.int<udiv=N> ops,
+  // enabling better tiling/vectorization for dynamic shapes.
+  void EmitSymbolicShapeBindings() {
+    int divisor = target_config_.seq_len_divisor;
+    if (divisor <= 0) return;
+
+    // Find input tensors with dynamic dimensions and collect unique symbols.
+    // We use one symbol per unique dynamic dimension position across all inputs.
+    // For LLM models, there's typically just one dynamic dim: seq_len.
+    int sym_count = 0;
+    struct Binding {
+      size_t input_idx;
+      std::string name;
+      std::string type;
+      std::vector<int64_t> shape;
+      std::vector<int> dyn_dim_symbols;  // symbol index per dim (-1 = static)
+    };
+    std::vector<Binding> bindings;
+
+    for (size_t i = 0; i < graph_inputs_.size(); ++i) {
+      auto type_info = graph_inputs_[i].TypeInfo();
+      if (type_info.GetONNXType() != ONNX_TYPE_TENSOR) continue;
+
+      auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
+      auto shape = tensor_info.GetShape();
+
+      bool has_dynamic = false;
+      for (auto dim : shape) {
+        if (dim < 0) { has_dynamic = true; break; }
+      }
+      if (!has_dynamic) continue;
+
+      Binding b;
+      b.input_idx = i;
+      b.name = SanitizeName(graph_inputs_[i].GetName());
+      b.type = FormatTensorType(graph_inputs_[i].TypeInfo());
+      b.shape = shape;
+      for (auto dim : shape) {
+        if (dim < 0) {
+          // Assign a symbol. For now, all dynamic dims share symbol 0
+          // (typical for LLMs where the only dynamic dim is seq_len).
+          b.dyn_dim_symbols.push_back(0);
+          sym_count = std::max(sym_count, 1);
+        } else {
+          b.dyn_dim_symbols.push_back(-1);
+        }
+      }
+      bindings.push_back(std::move(b));
+    }
+
+    if (bindings.empty()) return;
+
+    // Emit symbolic_int declarations.
+    // max_val = reasonable upper bound / divisor (e.g., 4096/128 = 32).
+    int max_sym_val = 4096 / divisor;
+    for (int s = 0; s < sym_count; ++s) {
+      out_ << std::format(
+          "    %__sym_s{0} = torch.symbolic_int \"s{0}\" "
+          "{{min_val = 1, max_val = {1}}} : !torch.int\n",
+          s, max_sym_val);
+    }
+
+    // Emit bind_symbolic_shape for each tensor with dynamic dims.
+    for (const auto& b : bindings) {
+      // Collect unique symbol references used by this binding.
+      std::vector<int> used_syms;
+      for (int sym : b.dyn_dim_symbols) {
+        if (sym >= 0 &&
+            std::find(used_syms.begin(), used_syms.end(), sym) ==
+                used_syms.end()) {
+          used_syms.push_back(sym);
+        }
+      }
+
+      // Build symbol list: [%__sym_s0, %__sym_s1, ...]
+      std::ostringstream sym_refs;
+      bool first = true;
+      for (int s : used_syms) {
+        if (!first) sym_refs << ", ";
+        first = false;
+        sym_refs << "%__sym_s" << s;
+      }
+
+      // Build affine map: ()[s0] -> (static_dim, s0 * divisor, ...)
+      std::ostringstream map_params, map_results;
+      first = true;
+      for (int s : used_syms) {
+        if (!first) map_params << ", ";
+        first = false;
+        map_params << "s" << s;
+      }
+
+      first = true;
+      for (size_t d = 0; d < b.shape.size(); ++d) {
+        if (!first) map_results << ", ";
+        first = false;
+        if (b.dyn_dim_symbols[d] >= 0) {
+          map_results << "s" << b.dyn_dim_symbols[d] << " * " << divisor;
+        } else {
+          map_results << b.shape[d];
+        }
+      }
+
+      out_ << std::format(
+          "    torch.bind_symbolic_shape %{0}, [{1}], "
+          "affine_map<()[{2}] -> ({3})> : {4}\n",
+          b.name, sym_refs.str(), map_params.str(),
+          map_results.str(), b.type);
+    }
   }
 
   OrtStatus* EmitFunctionBody() {

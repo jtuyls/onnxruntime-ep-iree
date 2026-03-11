@@ -214,6 +214,7 @@ OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
 
   TargetConfig target_config =
       TargetConfig::Create(ep->config_.target_arch, ep->config_.backend);
+  target_config.seq_len_divisor = ep->config_.seq_len_divisor;
 
   ORT_CXX_LOG_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
                        "IREE EP: Generating MLIR");

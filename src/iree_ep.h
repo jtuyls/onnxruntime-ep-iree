@@ -47,6 +47,9 @@ class IreeEp : public OrtEp, public ApiPtrs {
     // Path to directory containing pre-compiled kernel objects (.co files).
     // When non-empty, enables extern dispatch support.
     std::string extern_kernel_path = "";
+    // When > 0, asserts dynamic seq_len dimensions are divisible by this value.
+    // Enables better GPU codegen for dynamic prefill via util.assume.int<udiv>.
+    int seq_len_divisor = 0;
   };
 
   IreeEp(IreeEpFactory& factory, const std::string& name, const Config& config,

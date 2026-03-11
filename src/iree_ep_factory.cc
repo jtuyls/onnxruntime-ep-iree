@@ -414,6 +414,9 @@ OrtStatus* ORT_API_CALL IreeEpFactory::CreateEpImpl(
                                           "0") == "1";
     config.extern_kernel_path =
         sess_opts.GetConfigEntryOrDefault("ep.iree.extern_kernel_path", "");
+    std::string divisor_str =
+        sess_opts.GetConfigEntryOrDefault("ep.iree.seq_len_divisor", "0");
+    config.seq_len_divisor = std::atoi(divisor_str.c_str());
   }
 
   // Select backend based on driver.
