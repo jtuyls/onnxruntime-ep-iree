@@ -30,6 +30,7 @@
 #include "dim_spec.h"
 #include "iree_wrappers.h"
 #include "ort_import.h"
+#include "support.h"
 
 namespace onnxruntime::iree {
 
@@ -67,7 +68,7 @@ struct TargetConfig {
 // and provider for the archive. They remain null if no parameters are needed.
 // com.iree:ExternDispatch nodes are emitted as hal.dispatch.extern ops using
 // the target info from target_config.
-OrtStatus* GenerateMlir(
+MaybeError GenerateMlir(
     const Ort::ConstGraph& graph, const OrtApi& ort_api,
     const std::string& mlir_path, const std::string& irpa_path,
     const std::vector<std::pair<std::string, DimSpecVariant>>& variants,

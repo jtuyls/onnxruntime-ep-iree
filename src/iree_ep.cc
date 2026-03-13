@@ -269,7 +269,7 @@ OrtStatus* ORT_API_CALL IreeEp::CompileImpl(
   ORT_CXX_LOGF_NOEXCEPT(ep->logger_, ORT_LOGGING_LEVEL_INFO,
                         "IREE EP: Generating MLIR (%zu variants)",
                         mlir_variants.size());
-  ORT_RETURN_IF_ERROR(
+  IREE_ORT_RETURN_IF_MAYBE_ERROR(
       GenerateMlir(graph, ep->ort_api, mlir_file.Path(), irpa_file.Path(),
                    mlir_variants, function_names, parameter_index,
                    parameter_provider, std::move(target_config)));
