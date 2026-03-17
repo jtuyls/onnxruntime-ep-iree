@@ -226,7 +226,14 @@ def try_compile(model, device, kernel_dir, target_arch):
         pathlib.Path(model_path).unlink(missing_ok=True)
 
 
-def try_generate_mlir(model, device, kernel_dir, target_arch, assert_compiles=False):
+def try_generate_mlir(
+    model,
+    device,
+    kernel_dir,
+    target_arch,
+    extra_provider_options=None,
+    assert_compiles=False,
+):
     """Generate MLIR for a model via the EP. Returns (mlir_str, error_msg).
 
     Uses save_intermediates to keep the MLIR file that the EP writes before
@@ -270,6 +277,8 @@ def try_generate_mlir(model, device, kernel_dir, target_arch, assert_compiles=Fa
             "extern_kernel_path": kernel_dir,
             "save_intermediates": "1",
         }
+        if extra_provider_options:
+            provider_options.update(extra_provider_options)
         sess_options.add_provider_for_devices([device], provider_options)
         ort.InferenceSession(model_path, sess_options=sess_options)
         # Session succeeded -- MLIR gen worked and iree-compile worked.
