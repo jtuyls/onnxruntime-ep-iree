@@ -227,6 +227,7 @@ class MlirGenerator {
   OrtStatus* Generate() {
     CollectMetadata();
     BuildShapeRefinementMaps();
+    CollectGlobalDeclarations();
     OrtStatus* status = EmitModuleHeader();
     if (status) return status;
     EmitSymbolicShapeBindings();
@@ -287,6 +288,73 @@ class MlirGenerator {
     initializers_ = initializers;
   }
 
+  // Scan graph for LoadGlobal nodes and collect their declarations.
+  // Groups all KV globals into a single combined buffer to avoid aliasing.
+  void CollectGlobalDeclarations() {
+    auto nodes = graph_.GetNodes();
+    for (const auto& node : nodes) {
+      if (node.GetDomain() != "com.iree" ||
+          node.GetOperatorType() != "LoadGlobal")
+        continue;
+
+      auto attrs = node.GetAttributes();
+      std::string name;
+      std::vector<int64_t> shape;
+      int64_t dtype = 10;  // default: FLOAT16
+
+      for (const auto& attr : attrs) {
+        if (attr.GetName() == "name") {
+          attr.GetValue(name);
+        } else if (attr.GetName() == "shape") {
+          attr.GetValueArray(shape);
+        } else if (attr.GetName() == "dtype") {
+          attr.GetValue(dtype);
+        }
+      }
+
+      if (!name.empty() && !shape.empty()) {
+        GlobalDecl decl;
+        decl.name = SanitizeName(name);
+        decl.shape = shape;
+        decl.elem_type = GetElementType(
+            static_cast<ONNXTensorElementDataType>(dtype), /*signless=*/true);
+        global_decls_.push_back(decl);
+      }
+    }
+
+    // Build combined KV cache: single tensor<2 x num_layers x H x S x D>
+    // dim0: 0=key, 1=value; dim1: layer index
+    // This avoids buffer aliasing issues with per-global insert_slice.
+    if (!global_decls_.empty()) {
+      int num_key = 0, num_value = 0;
+      for (const auto& g : global_decls_) {
+        if (g.name.find("past_key_") != std::string::npos) num_key++;
+        else if (g.name.find("past_value_") != std::string::npos) num_value++;
+      }
+      if (num_key > 0 && num_key == num_value && !global_decls_.empty()) {
+        // All KV globals should have the same shape [1, H, S, D]
+        auto& ref = global_decls_[0];
+        combined_kv_shape_ = {2, num_key};
+        // Append H, S, D from the per-layer shape (skip batch dim 0)
+        for (size_t i = 1; i < ref.shape.size(); ++i) {
+          combined_kv_shape_.push_back(ref.shape[i]);
+        }
+        combined_kv_elem_ = ref.elem_type;
+        use_combined_kv_ = true;
+
+        // Build index map: name → (kv_type, layer_idx)
+        for (const auto& g : global_decls_) {
+          int kv_type = -1, layer_idx = -1;
+          if (sscanf(g.name.c_str(), "past_key_%d", &layer_idx) == 1) kv_type = 0;
+          else if (sscanf(g.name.c_str(), "past_value_%d", &layer_idx) == 1) kv_type = 1;
+          if (kv_type >= 0 && layer_idx >= 0) {
+            kv_global_index_[g.name] = {kv_type, layer_idx};
+          }
+        }
+      }
+    }
+  }
+
   OrtStatus* EmitModuleHeader() {
     // Build function arguments.
     std::ostringstream args;
@@ -296,10 +364,13 @@ class MlirGenerator {
       }
       std::string name = SanitizeName(graph_inputs_[i].GetName());
       std::string type = FormatTensorType(graph_inputs_[i].TypeInfo());
+
       args << "%" << name << ": " << type;
+
       // Store graph input types as refined types so free dimension overrides
       // (e.g., seq_len=1 for decode) propagate through the entire graph.
       // Without this, node-level TypeInfo returns original dynamic shapes.
+      // Always store the vtensor type (immutable) for use in computation.
       refined_types_[graph_inputs_[i].GetName()] = type;
     }
 
@@ -325,6 +396,33 @@ class MlirGenerator {
            << target_config_.target_arch << "\"}>\n";
     }
     out_ << "module {\n";
+
+    // Emit util.global mutable declarations for stateful KV cache.
+    if (use_combined_kv_) {
+      // Single combined KV buffer: tensor<2 x L x H x S x D>
+      std::ostringstream shape_str;
+      for (size_t i = 0; i < combined_kv_shape_.size(); ++i) {
+        shape_str << combined_kv_shape_[i] << "x";
+      }
+      out_ << std::format(
+          "  util.global private mutable @kv_cache = dense<0.0>"
+          " : tensor<{0}{1}>\n\n",
+          shape_str.str(), combined_kv_elem_);
+    } else {
+      for (const auto& g : global_decls_) {
+        std::ostringstream shape_str;
+        for (size_t i = 0; i < g.shape.size(); ++i) {
+          shape_str << g.shape[i] << "x";
+        }
+        out_ << std::format(
+            "  util.global private mutable @{0} = dense<0.0>"
+            " : tensor<{1}{2}>\n",
+            g.name, shape_str.str(), g.elem_type);
+      }
+      if (!global_decls_.empty()) {
+        out_ << "\n";
+      }
+    }
 
     constexpr std::string_view func_schema =
         R"(  func.func @{0}({1}) -> ({2})
@@ -528,9 +626,16 @@ class MlirGenerator {
   }
 
   OrtStatus* EmitNode(const Ort::ConstNode& node) {
-    if (node.GetDomain() == "com.iree" &&
-        node.GetOperatorType() == "ExternDispatch") {
-      return EmitExternDispatch(node, extern_id_++);
+    if (node.GetDomain() == "com.iree") {
+      if (node.GetOperatorType() == "ExternDispatch") {
+        return EmitExternDispatch(node, extern_id_++);
+      }
+      if (node.GetOperatorType() == "LoadGlobal") {
+        return EmitLoadGlobal(node);
+      }
+      if (node.GetOperatorType() == "StoreGlobal") {
+        return EmitStoreGlobal(node);
+      }
     }
 
     std::string op_type = node.GetOperatorType();
@@ -1837,6 +1942,191 @@ class MlirGenerator {
     return nullptr;
   }
 
+  // Emits a util.global.load (or extract_slice from combined buffer) for LoadGlobal.
+  OrtStatus* EmitLoadGlobal(const Ort::ConstNode& node) {
+    auto outputs = node.GetOutputs();
+    auto attrs = node.GetAttributes();
+
+    std::string name;
+    std::vector<int64_t> shape;
+    int64_t dtype = 10;  // FLOAT16
+
+    for (const auto& attr : attrs) {
+      if (attr.GetName() == "name") attr.GetValue(name);
+      else if (attr.GetName() == "shape") attr.GetValueArray(shape);
+      else if (attr.GetName() == "dtype") attr.GetValue(dtype);
+    }
+
+    if (name.empty() || shape.empty() || outputs.empty() || !outputs[0]) {
+      return MakeError("LoadGlobal: missing name, shape, or output");
+    }
+
+    std::string san_name = SanitizeName(name);
+    std::string out_ssa = SanitizeName(outputs[0].GetName());
+    std::string elem = GetElementType(
+        static_cast<ONNXTensorElementDataType>(dtype), /*signless=*/true);
+
+    // Build per-layer tensor type: tensor<1xHxSxDxelem>
+    std::ostringstream ttype;
+    ttype << "tensor<";
+    for (size_t i = 0; i < shape.size(); ++i) {
+      ttype << shape[i] << "x";
+    }
+    ttype << elem << ">";
+
+    std::string vtype = BuildVtensorType(
+        shape, GetElementType(static_cast<ONNXTensorElementDataType>(dtype)));
+
+    if (use_combined_kv_) {
+      // Extract from combined kv_cache: tensor<2xLxHxSxDxelem>
+      auto it = kv_global_index_.find(san_name);
+      if (it == kv_global_index_.end()) {
+        return MakeError("LoadGlobal: {} not found in kv_global_index", san_name);
+      }
+      int kv_type = it->second.first;   // 0=key, 1=value
+      int layer_idx = it->second.second;
+
+      // Build combined cache type string
+      std::ostringstream cache_ttype;
+      cache_ttype << "tensor<";
+      for (size_t i = 0; i < combined_kv_shape_.size(); ++i) {
+        cache_ttype << combined_kv_shape_[i] << "x";
+      }
+      cache_ttype << combined_kv_elem_ << ">";
+
+      // Sizes for extract_slice: [1, 1, H, S, D]
+      std::ostringstream sizes;
+      sizes << "1, 1";
+      for (size_t i = 1; i < shape.size(); ++i) {
+        sizes << ", " << shape[i];
+      }
+
+      // Load global, extract_slice, then convert to vtensor
+      // We load the global once and reuse. Use a static flag to emit the load once.
+      if (kv_cache_loaded_ssa_.empty()) {
+        kv_cache_loaded_ssa_ = "__kv_cache_buf";
+        out_ << std::format(
+            "    %{0} = util.global.load @kv_cache : {1}\n",
+            kv_cache_loaded_ssa_, cache_ttype.str());
+      }
+
+      out_ << std::format(
+          "    %{0}_raw = tensor.extract_slice %{1}[{2}, {3}, 0, 0, 0]"
+          " [{4}] [1, 1, 1, 1, 1]"
+          " : {5} to {6}\n"
+          "    %{0} = torch_c.from_builtin_tensor %{0}_raw : {6} -> {7}\n",
+          out_ssa,                      // {0}
+          kv_cache_loaded_ssa_,         // {1}
+          kv_type,                      // {2}
+          layer_idx,                    // {3}
+          sizes.str(),                  // {4}
+          cache_ttype.str(),            // {5}
+          ttype.str(),                  // {6}
+          vtype);                       // {7}
+    } else {
+      // Per-global load (fallback)
+      out_ << std::format(
+          "    %{0}_raw = util.global.load @{1} : {2}\n"
+          "    %{0} = torch_c.from_builtin_tensor %{0}_raw : {2} -> {3}\n",
+          out_ssa, san_name, ttype.str(), vtype);
+    }
+
+    refined_types_[outputs[0].GetName()] = vtype;
+    return nullptr;
+  }
+
+  // Emits a util.global.store (or insert_slice into combined buffer) for StoreGlobal.
+  OrtStatus* EmitStoreGlobal(const Ort::ConstNode& node) {
+    auto inputs = node.GetInputs();
+    auto outputs = node.GetOutputs();
+    auto attrs = node.GetAttributes();
+
+    std::string name;
+    for (const auto& attr : attrs) {
+      if (attr.GetName() == "name") attr.GetValue(name);
+    }
+
+    if (name.empty() || inputs.empty() || !inputs[0]) {
+      return MakeError("StoreGlobal: missing name or input");
+    }
+
+    std::string san_name = SanitizeName(name);
+    std::string in_ssa = SanitizeName(inputs[0].GetName());
+    std::string in_vtype = GetVtensorType(
+        inputs[0].GetName(), inputs[0].TypeInfo());
+
+    // Parse vtensor type to get builtin tensor type.
+    std::vector<int64_t> dims;
+    std::string elem;
+    ParseVtensorType(in_vtype, dims, elem);
+    std::string elem_signless = elem;
+    if (elem_signless.starts_with("si")) {
+      elem_signless = "i" + elem_signless.substr(2);
+    }
+
+    std::ostringstream ttype;
+    ttype << "tensor<";
+    for (size_t i = 0; i < dims.size(); ++i) {
+      if (dims[i] < 0) ttype << "?x"; else ttype << dims[i] << "x";
+    }
+    ttype << elem_signless << ">";
+
+    if (use_combined_kv_) {
+      auto it = kv_global_index_.find(san_name);
+      if (it == kv_global_index_.end()) {
+        return MakeError("StoreGlobal: {} not found in kv_global_index", san_name);
+      }
+      int kv_type = it->second.first;
+      int layer_idx = it->second.second;
+
+      std::ostringstream cache_ttype;
+      cache_ttype << "tensor<";
+      for (size_t i = 0; i < combined_kv_shape_.size(); ++i) {
+        cache_ttype << combined_kv_shape_[i] << "x";
+      }
+      cache_ttype << combined_kv_elem_ << ">";
+
+      // Sizes: [1, 1, H, S, D]
+      std::ostringstream sizes;
+      sizes << "1, 1";
+      for (size_t i = 1; i < dims.size(); ++i) {
+        sizes << ", " << dims[i];
+      }
+
+      // Load current cache, insert_slice, store back
+      // Each store chains: load → insert_slice → store
+      out_ << std::format(
+          "    %{0}_store_val = torch_c.to_builtin_tensor %{1} : {2} -> {3}\n"
+          "    %{0}_store_buf = util.global.load @kv_cache : {4}\n"
+          "    %{0}_store_new = tensor.insert_slice %{0}_store_val"
+          " into %{0}_store_buf[{5}, {6}, 0, 0, 0]"
+          " [{7}] [1, 1, 1, 1, 1]"
+          " : {3} into {4}\n"
+          "    util.global.store %{0}_store_new, @kv_cache : {4}\n",
+          san_name,                     // {0}
+          in_ssa,                       // {1}
+          in_vtype,                     // {2}
+          ttype.str(),                  // {3}
+          cache_ttype.str(),            // {4}
+          kv_type,                      // {5}
+          layer_idx,                    // {6}
+          sizes.str());                 // {7}
+    } else {
+      out_ << std::format(
+          "    %{0}_store_tmp = torch_c.to_builtin_tensor %{1} : {2} -> {3}\n"
+          "    util.global.store %{0}_store_tmp, @{0} : {3}\n",
+          san_name, in_ssa, in_vtype, ttype.str());
+    }
+
+    if (!outputs.empty() && outputs[0]) {
+      std::string out_name = outputs[0].GetName();
+      cast_aliases_[out_name] = inputs[0].GetName();
+      refined_types_[out_name] = in_vtype;
+    }
+
+    return nullptr;
+  }
+
   void EmitReturn() {
     std::ostringstream ret_values;
     std::ostringstream ret_types;
@@ -2946,6 +3236,22 @@ class MlirGenerator {
   // the intermediate having only one consumer, both are skipped and the
   // second output aliases to the first input.
   std::unordered_map<std::string, std::string> cast_aliases_;
+
+  // Global declarations for stateful KV cache (util.global mutable).
+  struct GlobalDecl {
+    std::string name;
+    std::vector<int64_t> shape;
+    std::string elem_type;  // e.g., "f16"
+  };
+  std::vector<GlobalDecl> global_decls_;
+
+  // Combined KV cache: single tensor<2 x L x H x S x D> to avoid aliasing.
+  bool use_combined_kv_ = false;
+  std::vector<int64_t> combined_kv_shape_;  // [2, L, H, S, D]
+  std::string combined_kv_elem_;            // "f16"
+  std::unordered_map<std::string, std::pair<int, int>> kv_global_index_;  // name → (kv_type, layer_idx)
+  std::string kv_cache_loaded_ssa_;  // SSA name for the loaded kv_cache buffer
+
 
   // Resolves aliases: follows cast_aliases_ chain to find the canonical name.
   std::string ResolveAlias(const std::string& name) const {

@@ -13,9 +13,12 @@
 #include "iree_ep_factory.h"
 
 #include <algorithm>
+#include <cstring>
 #include <memory>
 #include <mutex>
 
+#include "iree/async/util/proactor_pool.h"
+#include "iree/base/internal/cpu.h"
 #include "iree_allocator.h"
 #include "iree_data_transfer.h"
 #include "iree_ep.h"
@@ -62,8 +65,53 @@ struct ExternDispatchOp
   }
 };
 
-// File-static instance — must outlive all sessions.
+// Stub custom op for LoadGlobal — loads a KV tensor from util.global.
+struct LoadGlobalOp
+    : Ort::CustomOpBase<LoadGlobalOp, ExternDispatchKernel, false> {
+  const char* GetName() const { return "LoadGlobal"; }
+  size_t GetInputTypeCount() const { return 0; }
+  ONNXTensorElementDataType GetInputType(size_t) const {
+    return ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+  }
+  size_t GetOutputTypeCount() const { return 1; }
+  ONNXTensorElementDataType GetOutputType(size_t) const {
+    return ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+  }
+  OrtCustomOpInputOutputCharacteristic GetOutputCharacteristic(size_t) const {
+    return INPUT_OUTPUT_VARIADIC;
+  }
+  bool GetVariadicOutputHomogeneity() const { return false; }
+  void* CreateKernel(const OrtApi&, const OrtKernelInfo*) const {
+    return nullptr;
+  }
+};
+
+// Stub custom op for StoreGlobal — stores updated KV to util.global.
+// Has 1 input (the tensor to store) and 0 outputs (pure side effect).
+struct StoreGlobalOp
+    : Ort::CustomOpBase<StoreGlobalOp, ExternDispatchKernel, false> {
+  const char* GetName() const { return "StoreGlobal"; }
+  size_t GetInputTypeCount() const { return 1; }
+  ONNXTensorElementDataType GetInputType(size_t) const {
+    return ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+  }
+  OrtCustomOpInputOutputCharacteristic GetInputCharacteristic(size_t) const {
+    return INPUT_OUTPUT_VARIADIC;
+  }
+  bool GetVariadicInputHomogeneity() const { return false; }
+  size_t GetOutputTypeCount() const { return 0; }
+  ONNXTensorElementDataType GetOutputType(size_t) const {
+    return ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+  }
+  void* CreateKernel(const OrtApi&, const OrtKernelInfo*) const {
+    return nullptr;
+  }
+};
+
+// File-static instances — must outlive all sessions.
 ExternDispatchOp g_extern_dispatch_op;
+LoadGlobalOp g_load_global_op;
+StoreGlobalOp g_store_global_op;
 
 }  // namespace
 
@@ -95,6 +143,8 @@ IreeEpFactory::IreeEpFactory(const char* ep_name, ApiPtrs apis,
   // Register the com.iree custom op domain for ExternDispatch nodes.
   extern_dispatch_domain_ = Ort::CustomOpDomain("com.iree");
   extern_dispatch_domain_.Add(&g_extern_dispatch_op);
+  extern_dispatch_domain_.Add(&g_load_global_op);
+  extern_dispatch_domain_.Add(&g_store_global_op);
 
   // Initialize IREE runtime instance (shared across all EPs).
   iree_runtime_instance_options_t instance_options;
@@ -250,10 +300,28 @@ iree_hal_device_t* IreeEpFactory::GetDeviceForIdLocked(uint32_t device_id) {
   // Build device URI and create HAL device.
   std::string device_uri = std::string(driver_name) + "://" + device_path;
   HalDevicePtr hal_device;
-  iree_status_t status = iree_hal_create_device(
-      iree_runtime_instance_driver_registry(IreeInstance()),
-      iree_make_string_view(device_uri.data(), device_uri.size()),
-      iree_allocator_system(), hal_device.ForOutput());
+
+  // Create a proactor pool for async I/O.
+  // NOTE: Using a minimal pool with no runner (caller-driven polling)
+  // to avoid potential deadlocks with HIP dispatch chains.
+  iree_async_proactor_pool_t* proactor_pool = NULL;
+  iree_async_proactor_pool_options_t pool_opts;
+  memset(&pool_opts, 0, sizeof(pool_opts));  // no runner
+  iree_status_t status = iree_async_proactor_pool_create(
+      1, /*node_ids=*/NULL,
+      pool_opts, iree_allocator_system(),
+      &proactor_pool);
+
+  if (iree_status_is_ok(status)) {
+    iree_hal_device_create_params_t create_params =
+        iree_hal_device_create_params_default();
+    create_params.proactor_pool = proactor_pool;
+    status = iree_hal_create_device(
+        iree_runtime_instance_driver_registry(IreeInstance()),
+        iree_make_string_view(device_uri.data(), device_uri.size()),
+        &create_params, iree_allocator_system(), hal_device.ForOutput());
+  }
+  iree_async_proactor_pool_release(proactor_pool);
 
   if (!iree_status_is_ok(status)) {
     ORT_CXX_LOGF_NOEXCEPT(logger_, ORT_LOGGING_LEVEL_ERROR,
