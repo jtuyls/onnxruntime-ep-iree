@@ -322,6 +322,52 @@ class MlirGenerator {
     }
     out_ << "module {\n";
 
+    // Emit util.global declarations for stateful KV cache.
+    // Pre-scan nodes for com.iree:LoadGlobal to discover globals.
+    auto nodes = graph_.GetNodes();
+    for (const auto& node : nodes) {
+      if (node.GetDomain() == "com.iree" &&
+          node.GetOperatorType() == "LoadGlobal") {
+        // Get global name from attribute.
+        std::string global_name;
+        for (const auto& attr : node.GetAttributes()) {
+          if (attr.GetName() == "global_name") {
+            attr.GetValue(global_name);
+          }
+        }
+        if (!global_name.empty() &&
+            declared_globals_.find(global_name) == declared_globals_.end()) {
+          // Get output type to determine the tensor shape.
+          auto outputs = node.GetOutputs();
+          if (outputs.size() > 0 && outputs[0]) {
+            std::string tensor_type = GetVtensorType(
+                outputs[0].GetName(), outputs[0].TypeInfo());
+            // Convert vtensor type to builtin tensor type for the global.
+            std::vector<int64_t> dims;
+            std::string elem;
+            std::string builtin_type;
+            if (ParseVtensorType(tensor_type, dims, elem)) {
+              std::ostringstream ss;
+              ss << "tensor<";
+              for (size_t d = 0; d < dims.size(); ++d) {
+                if (dims[d] <= 0) ss << "?";
+                else ss << dims[d];
+                ss << "x";
+              }
+              ss << elem << ">";
+              builtin_type = ss.str();
+            } else {
+              builtin_type = FormatMlirTensorType(outputs[0].TypeInfo());
+            }
+            out_ << std::format(
+                "  util.global private mutable @{} = dense<0.0> : {}\n",
+                global_name, builtin_type);
+            declared_globals_[global_name] = builtin_type;
+          }
+        }
+      }
+    }
+
     constexpr std::string_view func_schema =
         R"(  func.func @{0}({1}) -> ({2})
       attributes {{
@@ -524,9 +570,16 @@ class MlirGenerator {
   }
 
   OrtStatus* EmitNode(const Ort::ConstNode& node) {
-    if (node.GetDomain() == "com.iree" &&
-        node.GetOperatorType() == "ExternDispatch") {
-      return EmitExternDispatch(node, extern_id_++);
+    if (node.GetDomain() == "com.iree") {
+      if (node.GetOperatorType() == "ExternDispatch") {
+        return EmitExternDispatch(node, extern_id_++);
+      }
+      if (node.GetOperatorType() == "LoadGlobal") {
+        return EmitLoadGlobal(node);
+      }
+      if (node.GetOperatorType() == "StoreGlobal") {
+        return EmitStoreGlobal(node);
+      }
     }
 
     std::string op_type = node.GetOperatorType();
@@ -857,7 +910,8 @@ class MlirGenerator {
               break;
             }
             if (it->second.op_type == "Reshape" ||
-                it->second.op_type == "Cast") {
+                it->second.op_type == "Cast" ||
+                it->second.op_type == "Unsqueeze") {
               cur = it->second.input_names[0];
               continue;
             }
@@ -1276,6 +1330,56 @@ class MlirGenerator {
       }
     }
 
+    // MatMul f16→f32 accumulation promotion for gfx1100 (RDNA3).
+    // Disabled: causes codegen distribution failures with static shapes.
+    // The model produces correct text output without this promotion.
+    // TODO: Re-enable selectively for problematic matmul shapes.
+    if (false && op_type == "MatMul" && !target_config_.target_arch.empty() &&
+        inputs.size() >= 2 && inputs[0] && inputs[1] &&
+        outputs.size() >= 1 && outputs[0]) {
+      auto info_a = inputs[0].TypeInfo().GetTensorTypeAndShapeInfo();
+      auto info_b = inputs[1].TypeInfo().GetTensorTypeAndShapeInfo();
+      if (info_a.GetElementType() == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 &&
+          info_b.GetElementType() == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16) {
+        std::string out_name = SanitizeName(output_names[0]);
+        std::string a_name = SanitizeName(inputs[0].GetName());
+        std::string b_name = SanitizeName(inputs[1].GetName());
+        std::string a_type = GetVtensorType(inputs[0].GetName(), inputs[0].TypeInfo());
+        std::string b_type = GetVtensorType(inputs[1].GetName(), inputs[1].TypeInfo());
+        // Build f32 type strings by replacing "f16" with "f32".
+        auto replace_f16 = [](std::string s) {
+          size_t pos = s.rfind("f16");
+          if (pos != std::string::npos) s.replace(pos, 3, "f32");
+          return s;
+        };
+        std::string a_f32_type = replace_f16(a_type);
+        std::string b_f32_type = replace_f16(b_type);
+        std::string out_f32_type = replace_f16(output_type_strs[0]);
+        std::string out_f16_type = output_type_strs[0];
+
+        // Cast inputs to f32.
+        out_ << std::format(
+            "    %{0}_a_f32 = torch.operator \"onnx.Cast\"(%{1}) "
+            "{{torch.onnx.to = 1 : si64}} : ({2}) -> {3}\n",
+            out_name, a_name, a_type, a_f32_type);
+        out_ << std::format(
+            "    %{0}_b_f32 = torch.operator \"onnx.Cast\"(%{1}) "
+            "{{torch.onnx.to = 1 : si64}} : ({2}) -> {3}\n",
+            out_name, b_name, b_type, b_f32_type);
+        // MatMul in f32.
+        out_ << std::format(
+            "    %{0}_f32 = torch.operator \"onnx.MatMul\""
+            "(%{0}_a_f32, %{0}_b_f32) {{}} : ({1}, {2}) -> {3}\n",
+            out_name, a_f32_type, b_f32_type, out_f32_type);
+        // Cast back to f16.
+        out_ << std::format(
+            "    %{0} = torch.operator \"onnx.Cast\"(%{0}_f32) "
+            "{{torch.onnx.to = 10 : si64}} : ({1}) -> {2}\n",
+            out_name, out_f32_type, out_f16_type);
+        return nullptr;
+      }
+    }
+
     // Constant shape tensor for non-Reshape ops (currently unused, kept for
     // potential future ConstantOfShape use).
     std::string const_shape_ssa_name;
@@ -1528,6 +1632,74 @@ class MlirGenerator {
   }
 
   // Emits a hal.dispatch.extern for a com.iree:ExternDispatch ONNX node.
+  // Emits a util.global.load for a com.iree:LoadGlobal node.
+  // LoadGlobal has one output (the loaded tensor) and a "global_name" attribute.
+  OrtStatus* EmitLoadGlobal(const Ort::ConstNode& node) {
+    auto outputs = node.GetOutputs();
+    if (outputs.empty() || !outputs[0])
+      return MakeError("LoadGlobal: missing output");
+
+    std::string global_name;
+    for (const auto& attr : node.GetAttributes()) {
+      if (attr.GetName() == "global_name") attr.GetValue(global_name);
+    }
+    if (global_name.empty())
+      return MakeError("LoadGlobal: missing 'global_name' attribute");
+
+    auto it = declared_globals_.find(global_name);
+    if (it == declared_globals_.end())
+      return MakeError("LoadGlobal: global '{}' not declared", global_name);
+
+    std::string builtin_type = it->second;
+    std::string out_name = SanitizeName(outputs[0].GetName());
+    std::string vtensor_type = GetVtensorType(
+        outputs[0].GetName(), outputs[0].TypeInfo());
+
+    // Emit: %raw = util.global.load @global_name : tensor<...>
+    //       %out = torch_c.from_builtin_tensor %raw : tensor<...> -> vtensor
+    out_ << std::format(
+        "    %{0}_raw = util.global.load @{1} : {2}\n"
+        "    %{0} = torch_c.from_builtin_tensor %{0}_raw : {2} -> {3}\n",
+        out_name, global_name, builtin_type, vtensor_type);
+
+    // Store refined type for downstream ops.
+    refined_types_[outputs[0].GetName()] = vtensor_type;
+    return nullptr;
+  }
+
+  // Emits a util.global.store for a com.iree:StoreGlobal node.
+  // StoreGlobal has one input (the tensor to store) and a "global_name" attribute.
+  OrtStatus* EmitStoreGlobal(const Ort::ConstNode& node) {
+    auto inputs = node.GetInputs();
+    if (inputs.empty() || !inputs[0])
+      return MakeError("StoreGlobal: missing input");
+
+    std::string global_name;
+    for (const auto& attr : node.GetAttributes()) {
+      if (attr.GetName() == "global_name") attr.GetValue(global_name);
+    }
+    if (global_name.empty())
+      return MakeError("StoreGlobal: missing 'global_name' attribute");
+
+    auto it = declared_globals_.find(global_name);
+    if (it == declared_globals_.end())
+      return MakeError("StoreGlobal: global '{}' not declared", global_name);
+
+    std::string builtin_type = it->second;
+    std::string in_name = SanitizeName(inputs[0].GetName());
+    std::string vtensor_type = GetVtensorType(
+        inputs[0].GetName(), inputs[0].TypeInfo());
+
+    // Emit: %raw = torch_c.to_builtin_tensor %in : vtensor -> tensor<...>
+    //       util.global.store %raw, @global_name : tensor<...>
+    out_ << std::format(
+        "    %{0}_store_raw = torch_c.to_builtin_tensor %{0} : {1} -> {2}\n"
+        "    util.global.store %{0}_store_raw, @{3} : {2}\n",
+        in_name, vtensor_type, builtin_type, global_name);
+
+    return nullptr;
+  }
+
   OrtStatus* EmitExternDispatch(const Ort::ConstNode& node, int extern_id) {
     std::string prefix = std::format("__extern_{}", extern_id);
     auto inputs = node.GetInputs();
@@ -1621,6 +1793,27 @@ class MlirGenerator {
       std::string vtensor_type = GetVtensorType(input_name, inputs[i].TypeInfo());
       std::string tensor_type = FormatMlirTensorType(inputs[i].TypeInfo());
       auto tensor_info = inputs[i].TypeInfo().GetTensorTypeAndShapeInfo();
+
+      // Use refined type info for the builtin tensor type. ORT's TypeInfo may
+      // have all-dynamic dims even when the EP has refined shapes. Parse the
+      // vtensor type (which uses refined shapes) and rebuild the tensor type.
+      std::vector<int64_t> refined_dims;
+      std::string refined_elem;
+      if (ParseVtensorType(vtensor_type, refined_dims, refined_elem)) {
+        std::string signless_elem =
+            GetElementType(tensor_info.GetElementType(), /*signless=*/true);
+        std::ostringstream refined_ss;
+        refined_ss << "tensor<";
+        for (size_t d = 0; d < refined_dims.size(); ++d) {
+          if (refined_dims[d] <= 0) refined_ss << "?";
+          else refined_ss << refined_dims[d];
+          if (d + 1 < refined_dims.size()) refined_ss << "x";
+          else refined_ss << "x" << signless_elem;
+        }
+        refined_ss << ">";
+        tensor_type = refined_ss.str();
+      }
+
       std::string raw = std::format("{}_raw_{}", prefix, i);
       raw_input_names[i] = raw;
       raw_input_types[i] = tensor_type;
@@ -1719,21 +1912,109 @@ class MlirGenerator {
       }
     }
 
+    // For dynamic tensor types (containing '?'), we need to extract the
+    // dynamic dimensions and annotate them in the dispatch signature with
+    // {%dim0, %dim1, ...} syntax. This is required by hal.dispatch.extern.
+    // We collect all dynamic dims from inputs and outputs into a shared pool
+    // keyed by the raw tensor name.
+    auto emit_dynamic_dims = [&](const std::string& raw_name,
+                                  const std::string& tensor_type)
+        -> std::string {
+      // Count '?' occurrences in the tensor type.
+      size_t ndyn = 0;
+      for (char c : tensor_type) if (c == '?') ndyn++;
+      if (ndyn == 0) return "";
+      // Emit tensor.dim ops for each dynamic dimension.
+      std::vector<std::string> dim_names;
+      size_t dim_idx = 0;
+      for (size_t pos = 0; pos < tensor_type.size(); ++pos) {
+        if (tensor_type[pos] == '?') {
+          std::string dname = raw_name + "_d" + std::to_string(dim_idx);
+          out_ << std::format(
+              "    %{0}_cidx = arith.constant {1} : index\n"
+              "    %{0} = tensor.dim %{2}, %{0}_cidx : {3}\n",
+              dname, dim_idx, raw_name, tensor_type);
+          dim_names.push_back("%" + dname);
+          dim_idx++;
+        }
+      }
+      return "{" + Join(dim_names, ", ") + "}";
+    };
+
     std::vector<std::string> dispatch_arg_types;
     for (size_t i = 0; i < pc_names.size(); ++i) {
       dispatch_arg_types.push_back("i32");
     }
     for (size_t i = 0; i < raw_input_types.size(); ++i) {
       if (!raw_input_types[i].empty() && !scalar_input_indices.count(i)) {
-        dispatch_arg_types.push_back(raw_input_types[i]);
+        std::string annot = emit_dynamic_dims(
+            raw_input_names[i], raw_input_types[i]);
+        dispatch_arg_types.push_back(raw_input_types[i] + annot);
       }
     }
 
+    // For output types, we need dim annotations too. Outputs don't have
+    // raw tensors yet (they're created by the dispatch), so we tie their
+    // dynamic dims to the first input tensor that shares the same dynamic
+    // dimension. For typical MoE patterns, all dynamic dims are N (token
+    // count) from the first input.
     std::string ret_types_str;
-    if (out_raw_types.size() == 1) {
-      ret_types_str = out_raw_types[0];
+    std::vector<std::string> annotated_out_types;
+    for (size_t i = 0; i < out_raw_types.size(); ++i) {
+      size_t ndyn = 0;
+      for (char c : out_raw_types[i]) if (c == '?') ndyn++;
+      if (ndyn == 0) {
+        annotated_out_types.push_back(out_raw_types[i]);
+      } else {
+        // Find the first input with a dynamic dim to share.
+        // If no input is dynamic, resolve the output ? to static dim from
+        // the first non-scalar input's dim[0].
+        std::string annot;
+        for (size_t j = 0; j < raw_input_types.size() && annot.empty(); ++j) {
+          if (raw_input_types[j].empty() || scalar_input_indices.count(j))
+            continue;
+          size_t inp_ndyn = 0;
+          for (char c : raw_input_types[j]) if (c == '?') inp_ndyn++;
+          if (inp_ndyn > 0) {
+            std::string dname = raw_input_names[j] + "_d0";
+            std::vector<std::string> parts(ndyn, "%" + dname);
+            annot = "{" + Join(parts, ", ") + "}";
+          }
+        }
+        if (annot.empty()) {
+          // All inputs are static. Replace ? in output type with the
+          // known static dim from the first non-scalar input's first dim.
+          std::string resolved = out_raw_types[i];
+          for (size_t j = 0; j < raw_input_types.size(); ++j) {
+            if (raw_input_types[j].empty() || scalar_input_indices.count(j))
+              continue;
+            // Parse first dim from input type: tensor<DIMx...>
+            auto tp = raw_input_types[j];
+            size_t start = tp.find('<');
+            size_t end = tp.find('x', start);
+            if (start != std::string::npos && end != std::string::npos) {
+              std::string dim_str = tp.substr(start + 1, end - start - 1);
+              if (dim_str != "?") {
+                // Replace each ? in output with this static dim
+                size_t pos = 0;
+                while ((pos = resolved.find('?', pos)) != std::string::npos) {
+                  resolved.replace(pos, 1, dim_str);
+                  pos += dim_str.length();
+                }
+              }
+            }
+            break;
+          }
+          annotated_out_types.push_back(resolved);
+        } else {
+          annotated_out_types.push_back(out_raw_types[i] + annot);
+        }
+      }
+    }
+    if (annotated_out_types.size() == 1) {
+      ret_types_str = annotated_out_types[0];
     } else {
-      ret_types_str = "(" + Join(out_raw_types, ", ") + ")";
+      ret_types_str = "(" + Join(annotated_out_types, ", ") + ")";
     }
 
     std::vector<std::string> bindings;
@@ -1783,11 +2064,46 @@ class MlirGenerator {
                         Join(wg_size_parts, ", "));                  // {11}
 
     // Step 6: Bridge outputs back to torch types.
+    // When the output tensor type was resolved to static (no '?'), update
+    // the vtensor type to match so from_builtin_tensor types are consistent.
     for (size_t i = 0; i < out_raw_names.size(); ++i) {
+      std::string raw_type = annotated_out_types.size() > i
+          ? annotated_out_types[i] : out_raw_types[i];
+      // Strip any {%dim} annotation for the bridge type
+      auto brace = raw_type.find('{');
+      if (brace != std::string::npos) raw_type = raw_type.substr(0, brace);
+      std::string vt = out_vtensor_types[i];
+      // If raw_type has no '?' but vtensor has '?', replace '?' in vtensor
+      // with the corresponding static dim from raw_type.
+      if (raw_type.find('?') == std::string::npos &&
+          vt.find('?') != std::string::npos) {
+        // Parse dims from raw_type: tensor<AxBxCxdtype>
+        std::vector<std::string> raw_dims;
+        size_t s = raw_type.find('<') + 1;
+        while (s < raw_type.size()) {
+          size_t e = raw_type.find('x', s);
+          if (e == std::string::npos) break;
+          std::string d = raw_type.substr(s, e - s);
+          if (d.empty() || !std::isdigit(d[0])) break;
+          raw_dims.push_back(d);
+          s = e + 1;
+        }
+        // Replace each '?' in vtensor with corresponding raw dim
+        size_t di = 0;
+        for (size_t p = 0; p < vt.size() && di < raw_dims.size(); ++p) {
+          if (vt[p] == '?') {
+            vt.replace(p, 1, raw_dims[di++]);
+          }
+        }
+      }
       out_ << std::format(
           "    %{} = torch_c.from_builtin_tensor %{} : {} -> {}\n",
-          out_ssa_names[i], out_raw_names[i], out_raw_types[i],
-          out_vtensor_types[i]);
+          out_ssa_names[i], out_raw_names[i], raw_type, vt);
+      // Store the resolved vtensor type so downstream ExternDispatch nodes
+      // consuming this output use the correct (potentially static) type.
+      if (i < outputs.size() && outputs[i]) {
+        refined_types_[outputs[i].GetName()] = vt;
+      }
     }
     return nullptr;
   }
@@ -1980,9 +2296,13 @@ class MlirGenerator {
              op_type == "Where" ||
              op_type == "ScatterElements" || op_type == "GatherElements") {
       auto [ort_shape, dtype] = GetOrtOutputInfo(0);
-      // Find the highest-rank input with refined info to use for propagation.
-      // This handles broadcast cases like Mul([2048], [1,?,2048]) → [1,?,2048].
-      std::vector<int64_t> best_dims = in_dims;
+      // Collect refined dims from ALL inputs to compute broadcast shape.
+      // For each dim position, pick the largest known value (>1 wins over 1,
+      // known wins over unknown). This handles cases like:
+      //   Mul([?,1], [?,2048]) → [?,2048]
+      //   Mul([2048], [1,?,2048]) → [1,?,2048]
+      std::vector<std::vector<int64_t>> all_dims;
+      all_dims.push_back(in_dims);
       for (size_t i = 1; i < inputs.size(); ++i) {
         if (!inputs[i]) continue;
         std::string inp_name = inputs[i].GetName();
@@ -1990,9 +2310,29 @@ class MlirGenerator {
         std::string inp_type = GetVtensorType(inp_name, inputs[i].TypeInfo());
         std::vector<int64_t> inp_dims;
         std::string inp_elem;
-        if (ParseVtensorType(inp_type, inp_dims, inp_elem) &&
-            inp_dims.size() > best_dims.size()) {
-          best_dims = inp_dims;
+        if (ParseVtensorType(inp_type, inp_dims, inp_elem)) {
+          all_dims.push_back(inp_dims);
+        }
+      }
+      // Find the max rank across all inputs.
+      size_t max_rank = 0;
+      for (const auto& dims : all_dims) {
+        max_rank = std::max(max_rank, dims.size());
+      }
+      // Broadcast: right-align dims and pick the best for each position.
+      std::vector<int64_t> best_dims(max_rank, -1);
+      for (const auto& dims : all_dims) {
+        size_t offset = max_rank - dims.size();
+        for (size_t j = 0; j < dims.size(); ++j) {
+          int64_t d = dims[j];
+          int64_t& bd = best_dims[offset + j];
+          // Prefer known > 1 dims; known=1 is a broadcast dim.
+          if (d > 1) {
+            bd = d;
+          } else if (d == 1 && bd < 0) {
+            bd = 1;  // Only set 1 if nothing better known.
+          }
+          // d <= 0 means dynamic — keep existing bd if better.
         }
       }
       if (ort_shape.size() == best_dims.size()) {
@@ -2815,6 +3155,9 @@ class MlirGenerator {
 
   // Extern dispatch state.
   int extern_id_ = 0;
+
+  // Declared util.global names and their tensor types.
+  std::unordered_map<std::string, std::string> declared_globals_;
 
   // Counter for unique constant shape tensor names.
   int const_shape_counter_ = 0;

@@ -62,8 +62,59 @@ struct ExternDispatchOp
   }
 };
 
-// File-static instance — must outlive all sessions.
+// Stub ops for LoadGlobal and StoreGlobal (stateful KV cache).
+// Never executed — the EP compiles them via EmitLoadGlobal/EmitStoreGlobal.
+
+struct LoadGlobalKernel {
+  void Compute(OrtKernelContext*) {}
+};
+struct LoadGlobalOp
+    : Ort::CustomOpBase<LoadGlobalOp, LoadGlobalKernel, false> {
+  const char* GetName() const { return "LoadGlobal"; }
+  size_t GetInputTypeCount() const { return 0; }
+  ONNXTensorElementDataType GetInputType(size_t) const {
+    return ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+  }
+  size_t GetOutputTypeCount() const { return 1; }
+  ONNXTensorElementDataType GetOutputType(size_t) const {
+    return ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+  }
+  OrtCustomOpInputOutputCharacteristic GetOutputCharacteristic(size_t) const {
+    return INPUT_OUTPUT_VARIADIC;
+  }
+  bool GetVariadicOutputHomogeneity() const { return false; }
+  void* CreateKernel(const OrtApi&, const OrtKernelInfo*) const {
+    return nullptr;
+  }
+};
+
+struct StoreGlobalKernel {
+  void Compute(OrtKernelContext*) {}
+};
+struct StoreGlobalOp
+    : Ort::CustomOpBase<StoreGlobalOp, StoreGlobalKernel, false> {
+  const char* GetName() const { return "StoreGlobal"; }
+  size_t GetInputTypeCount() const { return 1; }
+  ONNXTensorElementDataType GetInputType(size_t) const {
+    return ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+  }
+  OrtCustomOpInputOutputCharacteristic GetInputCharacteristic(size_t) const {
+    return INPUT_OUTPUT_VARIADIC;
+  }
+  bool GetVariadicInputHomogeneity() const { return false; }
+  size_t GetOutputTypeCount() const { return 0; }
+  ONNXTensorElementDataType GetOutputType(size_t) const {
+    return ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+  }
+  void* CreateKernel(const OrtApi&, const OrtKernelInfo*) const {
+    return nullptr;
+  }
+};
+
+// File-static instances — must outlive all sessions.
 ExternDispatchOp g_extern_dispatch_op;
+LoadGlobalOp g_load_global_op;
+StoreGlobalOp g_store_global_op;
 
 }  // namespace
 
@@ -92,9 +143,12 @@ IreeEpFactory::IreeEpFactory(const char* ep_name, ApiPtrs apis,
   GetNumCustomOpDomains = GetNumCustomOpDomainsImpl;
   GetCustomOpDomains = GetCustomOpDomainsImpl;
 
-  // Register the com.iree custom op domain for ExternDispatch nodes.
+  // Register the com.iree custom op domain for ExternDispatch,
+  // LoadGlobal, and StoreGlobal nodes.
   extern_dispatch_domain_ = Ort::CustomOpDomain("com.iree");
   extern_dispatch_domain_.Add(&g_extern_dispatch_op);
+  extern_dispatch_domain_.Add(&g_load_global_op);
+  extern_dispatch_domain_.Add(&g_store_global_op);
 
   // Initialize IREE runtime instance (shared across all EPs).
   iree_runtime_instance_options_t instance_options;
