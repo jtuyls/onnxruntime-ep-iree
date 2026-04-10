@@ -810,12 +810,10 @@ class MlirGenerator {
                   "    %{0}_pc_k = arith.constant {2} : i32\n",
                   prefix, num_experts, top_k);
 
-              // Workload: ceil(N / 64) for 64 threads per workgroup.
+              // Workload: N tokens (one workgroup of 32 threads per token).
               out_ << std::format(
-                  "    %{0}_c64 = arith.constant 64 : index\n"
-                  "    %{0}_c63 = arith.constant 63 : index\n"
-                  "    %{0}_n_plus = arith.addi %{0}_dim_n, %{0}_c63 : index\n"
-                  "    %{0}_wl = arith.divui %{0}_n_plus, %{0}_c64 : index\n",
+                  "    %{0}_c1_wl = arith.constant 1 : index\n"
+                  "    %{0}_wl = arith.maxui %{0}_dim_n, %{0}_c1_wl : index\n",
                   prefix);
 
               // Output types — use static dim if known.
@@ -851,7 +849,7 @@ class MlirGenerator {
           #hal.executable.object<{{path = "{4}"}}>
         ]
       }})
-      attributes {{workgroup_size = [64 : index, 1 : index, 1 : index]}}
+      attributes {{workgroup_size = [32 : index, 1 : index, 1 : index]}}
 )",
                   prefix,             // {0}
                   gate_tensor_type,   // {1} input type
