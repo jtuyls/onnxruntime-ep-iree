@@ -128,6 +128,17 @@ struct RMSNormOp
   ONNXTensorElementDataType GetOutputType(size_t) const {
     return ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
   }
+  // Output shape = input[0] shape (RMSNorm preserves shape)
+  OrtStatusPtr InferOutputShapeFn(const OrtApi* api,
+                                   OrtShapeInferContext* ctx) const {
+    OrtTensorTypeAndShapeInfo* input_info = nullptr;
+    api->ShapeInferContext_GetInputTypeShape(ctx, 0, &input_info);
+    if (!input_info) return nullptr;
+    // Copy input type/shape to output
+    api->ShapeInferContext_SetOutputTypeShape(ctx, 0, input_info);
+    api->ReleaseTensorTypeAndShapeInfo(input_info);
+    return nullptr;
+  }
   void* CreateKernel(const OrtApi&, const OrtKernelInfo*) const {
     return nullptr;
   }

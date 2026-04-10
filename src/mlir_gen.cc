@@ -299,14 +299,18 @@ class MlirGenerator {
       args << "%" << name << ": " << type;
     }
 
-    // Build return types (use refined types if available).
+    // Build return types. We use ORT's raw TypeInfo here since refined types
+    // aren't computed yet (body hasn't been emitted). Store the types so
+    // EmitReturn can match them.
     std::ostringstream ret_types;
     for (size_t i = 0; i < graph_outputs_.size(); ++i) {
       if (i > 0) {
         ret_types << ", ";
       }
       std::string out_name = graph_outputs_[i].GetName();
-      ret_types << GetVtensorType(out_name, graph_outputs_[i].TypeInfo());
+      std::string otype = GetVtensorType(out_name, graph_outputs_[i].TypeInfo());
+      func_return_types_[out_name] = otype;
+      ret_types << otype;
     }
 
     // Define the #executable_target alias for hal.dispatch.extern objects()
@@ -2169,9 +2173,39 @@ class MlirGenerator {
         ret_values << ", ";
         ret_types << ", ";
       }
-      ret_values << "%" << SanitizeName(graph_outputs_[i].GetName());
       std::string out_name = graph_outputs_[i].GetName();
-      ret_types << GetVtensorType(out_name, graph_outputs_[i].TypeInfo());
+      std::string ssa_name = SanitizeName(out_name);
+
+      // Get the function signature type (stored during EmitModuleHeader).
+      // The SSA value may have a more specific type (e.g., [1,?,151936])
+      // while the signature has [?,?,151936]. Insert a cast to match.
+      std::string sig_type;
+      auto sig_it = func_return_types_.find(out_name);
+      if (sig_it != func_return_types_.end()) {
+        sig_type = sig_it->second;
+      } else {
+        sig_type = GetVtensorType(out_name, graph_outputs_[i].TypeInfo());
+      }
+
+      // Get the refined type for this output (computed during body emission)
+      std::string ssa_type = sig_type;
+      auto ref_it = refined_types_.find(out_name);
+      if (ref_it != refined_types_.end()) {
+        ssa_type = ref_it->second;
+      }
+
+      // Cast if types differ
+      if (ssa_type != sig_type) {
+        std::string cast_name = ssa_name + "_ret_cast";
+        out_ << std::format(
+            "    %{0} = torch.tensor_static_info_cast %{1} : "
+            "{2} to {3}\n",
+            cast_name, ssa_name, ssa_type, sig_type);
+        ssa_name = cast_name;
+      }
+
+      ret_values << "%" << ssa_name;
+      ret_types << sig_type;
     }
 
     out_ << std::format("    return {0} : {1}\n", ret_values.str(),
@@ -2393,12 +2427,51 @@ class MlirGenerator {
         for (size_t i = 0; i < best_dims.size(); ++i) {
           merged[i] = (ort_shape[i] >= 0) ? ort_shape[i] : best_dims[i];
         }
-        StoreRefined(0, BuildVtensorType(merged, GetElementType(dtype)));
+        auto elem = GetElementType(dtype);
+        if (elem.empty() && !best_dims.empty()) {
+          // dtype unknown — get from first input
+          if (inputs.size() > 0 && inputs[0])
+            elem = GetElementType(
+                inputs[0].TypeInfo().GetTensorTypeAndShapeInfo().GetElementType());
+        }
+        StoreRefined(0, BuildVtensorType(merged, elem));
+      } else if (ort_shape.empty() && !best_dims.empty()) {
+        // ORT returned empty shape (e.g., after custom op). Use best dims.
+        auto elem = GetElementType(dtype);
+        if (elem.empty() && inputs.size() > 0 && inputs[0])
+          elem = GetElementType(
+              inputs[0].TypeInfo().GetTensorTypeAndShapeInfo().GetElementType());
+        if (!elem.empty())
+          StoreRefined(0, BuildVtensorType(best_dims, elem));
       }
     }
     // MatMul: propagate batch dims from both inputs.
     else if (op_type == "MatMul") {
       auto [ort_shape, dtype] = GetOrtOutputInfo(0);
+      // When ORT returns empty shape (e.g., after custom op like RMSNorm),
+      // compute the output shape from input shapes. MatMul([...,M,K], [...,K,N])
+      // produces [...,M,N].
+      if (ort_shape.empty() && inputs.size() >= 2 && inputs[0] && inputs[1]) {
+        std::vector<int64_t> a_dims, b_dims;
+        std::string a_elem, b_elem;
+        std::string a_type = GetVtensorType(inputs[0].GetName(), inputs[0].TypeInfo());
+        std::string b_type = GetVtensorType(inputs[1].GetName(), inputs[1].TypeInfo());
+        if (ParseVtensorType(a_type, a_dims, a_elem) &&
+            ParseVtensorType(b_type, b_dims, b_elem) &&
+            a_dims.size() >= 2 && b_dims.size() >= 2) {
+          // Build output shape: batch dims from A + M from A + N from B
+          std::vector<int64_t> out_dims;
+          for (size_t i = 0; i + 2 < a_dims.size(); ++i)
+            out_dims.push_back(a_dims[i]);
+          out_dims.push_back(a_dims[a_dims.size()-2]);  // M
+          out_dims.push_back(b_dims[b_dims.size()-1]);  // N
+          ort_shape = out_dims;
+          // dtype may not be set either; default to input dtype
+          if (dtype == ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED) {
+            dtype = inputs[0].TypeInfo().GetTensorTypeAndShapeInfo().GetElementType();
+          }
+        }
+      }
       if (ort_shape.size() >= 2) {
         std::vector<int64_t> merged(ort_shape.begin(), ort_shape.end());
         // Gather batch dim info from all inputs.
@@ -3211,6 +3284,9 @@ class MlirGenerator {
 
   // Declared util.global names and their tensor types.
   std::unordered_map<std::string, std::string> declared_globals_;
+
+  // Function return types (stored during EmitModuleHeader for EmitReturn).
+  std::unordered_map<std::string, std::string> func_return_types_;
 
   // Counter for unique constant shape tensor names.
   int const_shape_counter_ = 0;
