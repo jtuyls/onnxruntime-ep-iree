@@ -111,10 +111,33 @@ struct StoreGlobalOp
   }
 };
 
+struct RMSNormKernel {
+  void Compute(OrtKernelContext*) {}
+};
+struct RMSNormOp
+    : Ort::CustomOpBase<RMSNormOp, RMSNormKernel, false> {
+  const char* GetName() const { return "RMSNorm"; }
+  // Input 0: data (dynamic type — output inherits this type)
+  // Input 1: weight (concrete f16 — ORT needs exactly 1 dynamic input)
+  size_t GetInputTypeCount() const { return 2; }
+  ONNXTensorElementDataType GetInputType(size_t idx) const {
+    return idx == 0 ? ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED
+                    : ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16;
+  }
+  size_t GetOutputTypeCount() const { return 1; }
+  ONNXTensorElementDataType GetOutputType(size_t) const {
+    return ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+  }
+  void* CreateKernel(const OrtApi&, const OrtKernelInfo*) const {
+    return nullptr;
+  }
+};
+
 // File-static instances — must outlive all sessions.
 ExternDispatchOp g_extern_dispatch_op;
 LoadGlobalOp g_load_global_op;
 StoreGlobalOp g_store_global_op;
+RMSNormOp g_rmsnorm_op;
 
 }  // namespace
 
@@ -149,6 +172,7 @@ IreeEpFactory::IreeEpFactory(const char* ep_name, ApiPtrs apis,
   extern_dispatch_domain_.Add(&g_extern_dispatch_op);
   extern_dispatch_domain_.Add(&g_load_global_op);
   extern_dispatch_domain_.Add(&g_store_global_op);
+  extern_dispatch_domain_.Add(&g_rmsnorm_op);
 
   // Initialize IREE runtime instance (shared across all EPs).
   iree_runtime_instance_options_t instance_options;

@@ -580,6 +580,9 @@ class MlirGenerator {
       if (node.GetOperatorType() == "StoreGlobal") {
         return EmitStoreGlobal(node);
       }
+      if (node.GetOperatorType() == "RMSNorm") {
+        return EmitRMSNorm(node);
+      }
     }
 
     std::string op_type = node.GetOperatorType();
@@ -1634,6 +1637,56 @@ class MlirGenerator {
   // Emits a hal.dispatch.extern for a com.iree:ExternDispatch ONNX node.
   // Emits a util.global.load for a com.iree:LoadGlobal node.
   // LoadGlobal has one output (the loaded tensor) and a "global_name" attribute.
+  // Emits torch.aten.rms_norm for a com.iree:RMSNorm custom op.
+  // RMSNorm(input, weight) with epsilon attribute → single fused dispatch.
+  OrtStatus* EmitRMSNorm(const Ort::ConstNode& node) {
+    auto inputs = node.GetInputs();
+    auto outputs = node.GetOutputs();
+    if (inputs.size() < 2 || !inputs[0] || !inputs[1] ||
+        outputs.empty() || !outputs[0])
+      return MakeError("RMSNorm: requires 2 inputs and 1 output");
+
+    std::string x_name = SanitizeName(inputs[0].GetName());
+    std::string w_name = SanitizeName(inputs[1].GetName());
+    std::string out_name = SanitizeName(outputs[0].GetName());
+    std::string x_type = GetVtensorType(inputs[0].GetName(), inputs[0].TypeInfo());
+    std::string w_type = GetVtensorType(inputs[1].GetName(), inputs[1].TypeInfo());
+    // Output type matches input type (RMSNorm preserves shape).
+    std::string out_type = x_type;
+
+    // Get epsilon from attribute (default 1e-6)
+    float eps = 1e-6f;
+    for (const auto& attr : node.GetAttributes()) {
+      if (attr.GetName() == "epsilon") {
+        attr.GetValue(eps);
+      }
+    }
+
+    // Get normalized_shape from weight dims (last dim of input)
+    auto w_info = inputs[1].TypeInfo().GetTensorTypeAndShapeInfo();
+    auto w_shape = w_info.GetShape();
+    if (w_shape.empty())
+      return MakeError("RMSNorm: weight must be at least 1D");
+    int64_t hidden_dim = w_shape[0];
+
+    // Emit torch.aten.rms_norm:
+    //   %out = torch.aten.rms_norm %x, [H], %weight, eps
+    out_ << std::format(
+        "    %{0}_h = torch.constant.int {1}\n"
+        "    %{0}_shape = torch.prim.ListConstruct %{0}_h "
+        ": (!torch.int) -> !torch.list<int>\n"
+        "    %{0}_eps = torch.constant.float {2:E}\n"
+        "    %{0} = torch.aten.rms_norm %{3}, %{0}_shape, %{4}, "
+        "%{0}_eps : {5}, !torch.list<int>, {6}, !torch.float -> {7}\n",
+        out_name, hidden_dim, eps,
+        x_name, w_name,
+        x_type, w_type, out_type);
+
+    // Store refined type for downstream ops.
+    refined_types_[outputs[0].GetName()] = out_type;
+    return nullptr;
+  }
+
   OrtStatus* EmitLoadGlobal(const Ort::ConstNode& node) {
     auto outputs = node.GetOutputs();
     if (outputs.empty() || !outputs[0])
